@@ -48,7 +48,7 @@ int main() {
     while(1) {
         XNextEvent(display, &event);
 
-        /* draw or redraw the window */
+        // draw or redraw the window
         if(event.type == Expose) {
             XFillRectangle(display, window, DefaultGC(display, screen), 20, 20, 10, 10);
             XDrawString(display, window, DefaultGC(display, screen), 50, next_line_y, cmd, strlen(cmd));
@@ -128,7 +128,7 @@ int main() {
         }
     }
 
-    /* close connection to server */
+    // close display
     XCloseDisplay(display);
 
     return 0;
