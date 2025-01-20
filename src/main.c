@@ -16,6 +16,7 @@
 #include "draw.h"
 #include "input.h"
 #include "config.h"
+#include "terminal_state.h"
 
 #define BUF_SIZE 1024
 
@@ -86,37 +87,41 @@ void spawn_shell() {
     close(slave_fd);
 }
 
-void handle_pty_output(Display *display, Window window, GC gc) {
-    char buffer[BUF_SIZE];
+void handle_pty_output(Display *display, Window window, GC gc, TerminalState *state) {
+    char ch;
     ssize_t num_read;
 
-    while ((num_read = read(master_fd, buffer, BUF_SIZE - 1)) > 0) {
-        buffer[num_read] = '\0';  // Null-terminate
+    while ((num_read = read(master_fd, &ch, 1)) > 0) {
+        if (ch == '\033') { // ESC character
+            // Start of ANSI escape sequence
+            char seq[32];
+            int seq_len = 0;
+            seq[seq_len++] = ch;
 
-        // Strip ANSI escape sequences (basic filtering)
-        char clean_buffer[BUF_SIZE];
-        int clean_index = 0;
-        int in_escape_sequence = 0;
-
-        for (ssize_t i = 0; i < num_read; i++) {
-            // Skip ANSI escape sequences
-            if (buffer[i] == '\033') { 
-                in_escape_sequence = 1;
-                continue;
-            }
-            if (in_escape_sequence) {
-                if (isalpha(buffer[i])) {
-                    in_escape_sequence = 0;
+            // Read next character to confirm '['
+            if (read(master_fd, &ch, 1) > 0) {
+                seq[seq_len++] = ch;
+                if (ch == '[') {
+                    // Read until final byte (between '@' and '~')
+                    while (seq_len < (int)sizeof(seq) - 1 && read(master_fd, &ch, 1) > 0) {
+                        seq[seq_len++] = ch;
+                        if (ch >= '@' && ch <= '~') {
+                            break;
+                        }
+                    }
+                    // Handle the ANSI sequence
+                    handle_ansi_sequence(seq, seq_len, state, display);
+                } else {
+                    // Not supported; ignore or handle other sequences
                 }
-                continue;
             }
-            clean_buffer[clean_index++] = buffer[i];
+        } else {
+            // Regular character
+            put_char(ch, state);
         }
-        clean_buffer[clean_index] = '\0';
-
-        append_text(clean_buffer);  // Append cleaned output to buffer
-        draw_text(display, window, gc); // Redraw with accumulated text
     }
+
+    draw_text(display, window, gc); // Redraw with updated buffer
 }
 
 int main() {
@@ -140,6 +145,7 @@ int main() {
                                  BlackPixel(display, screen),
                                  WhitePixel(display, screen));
 
+    XStoreName(display, window, "cupidterminal");
     XSelectInput(display, window, ExposureMask | KeyPressMask);
     XMapWindow(display, window);
 
@@ -148,6 +154,8 @@ int main() {
     // Start shell process in a pseudo-terminal
     spawn_shell();
 
+    initialize_xft(display, window);
+
     // Main event loop (handles both PTY output and X11 events)
     while (1) {
         FD_ZERO(&fds);
@@ -155,21 +163,25 @@ int main() {
         FD_SET(ConnectionNumber(display), &fds);
 
         if (select(master_fd + 1, &fds, NULL, NULL, NULL) > 0) {
-            // Handle shell output
             if (FD_ISSET(master_fd, &fds)) {
-                handle_pty_output(display, window, gc);
+                handle_pty_output(display, window, gc, &term_state);
             }
 
-            // Handle X11 events (keypresses, window updates)
             while (XPending(display)) {
                 XNextEvent(display, &event);
+
                 if (event.type == KeyPress) {
                     handle_keypress(display, window, &event);
+                } else if (event.type == Expose) {
+                    draw_text(display, window, gc);
+                } else if (event.type == SelectionNotify) {
+                    handle_paste_event(display, window, &event);
                 }
             }
         }
     }
 
+    cleanup_xft();
     XCloseDisplay(display);
     return 0;
 }
