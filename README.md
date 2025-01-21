@@ -2,6 +2,8 @@
 
 cupidterminal is a minimalist terminal emulator inspired by the principles of **suckless st**. It is designed to be **simple, efficient, and hackable**, adhering to the UNIX philosophy of doing one thing well.
 
+![preview](img/term.png)
+
 ## Features
 
 - **Lightweight**: Minimal dependencies, only requiring `Xlib` and `Xft`.
