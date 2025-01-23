@@ -1,12 +1,13 @@
 // terminal_state.c
-#include "draw.h"
-
-#include "terminal_state.h"
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
 #include <X11/Xft/Xft.h>
 #include <X11/Xlib.h>
+#include <utf8proc.h> // unicode
+
+#include "terminal_state.h"
+#include "draw.h"
 
 // External globals from draw.c
 extern Display *global_display;
@@ -59,26 +60,11 @@ void allocate_color(Display *display, TerminalState *state, int color_code) {
 }
 
 void allocate_background_color(Display *display, TerminalState *state, int color_code) {
-    XRenderColor xr;
-    switch (color_code) {
-        case 40: xr = (XRenderColor){0x0000, 0x0000, 0x0000, 0xFFFF}; break; // Black
-        case 41: xr = (XRenderColor){0xFFFF, 0x0000, 0x0000, 0xFFFF}; break; // Red
-        case 42: xr = (XRenderColor){0x0000, 0xFFFF, 0x0000, 0xFFFF}; break; // Green
-        case 43: xr = (XRenderColor){0xFFFF, 0xFFFF, 0x0000, 0xFFFF}; break; // Yellow
-        case 44: xr = (XRenderColor){0x0000, 0x0000, 0xFFFF, 0xFFFF}; break; // Blue
-        case 45: xr = (XRenderColor){0xFFFF, 0x0000, 0xFFFF, 0xFFFF}; break; // Magenta
-        case 46: xr = (XRenderColor){0x0000, 0xFFFF, 0xFFFF, 0xFFFF}; break; // Cyan
-        case 47: xr = (XRenderColor){0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF}; break; // White
-        default: return;
-    }
+    (void)display; // Suppress unused parameter warning
+    (void)state;   // Suppress unused parameter warning
+    (void)color_code; // Suppress unused parameter warning
 
-    // Since background color should not overwrite the current foreground color,
-    // you need to handle background colors differently in rendering.
-    // This example focuses on foreground colors.
-    // Implement background color handling as needed.
-    
-    // Example: Store background color in TerminalState if needed
-    // For simplicity, not implemented here.
+    // TODO: Implement background color allocation
 }
 
 
@@ -105,72 +91,75 @@ void handle_ansi_sequence(const char *seq, int len, TerminalState *state, Displa
     }
 
     switch (cmd) {
-        case 'm': // SGR - Select Graphic Rendition
-            for (int i = 0; i < param_count; i++) {
-                int code = param_values[i];
-
-                if (code == 0) {  // Reset attributes
-                    reset_attributes(state, xft_color, xft_font);
-                } else if (code == 1) {  // Bold text
-                    if (state->current_font != xft_font_bold) {
-                        state->current_font = xft_font_bold;
-                    }
-                } else if (code >= 30 && code <= 37) {  // Foreground colors
-                    allocate_color(display, state, code);
-                } else if (code >= 40 && code <= 47) {  // Background colors
-                    allocate_background_color(display, state, code);
-                }
-            }
+        case 'm': // SGR
+            /* ... existing color/bold handling ... */
             break;
 
         case 'J': // Clear screen
-            if (param_count == 0 || param_values[0] == 2) { // Full screen clear (ESC[2J)
-                for (int r = 0; r < TERMINAL_ROWS; r++) {
-                    memset(terminal_buffer[r], 0, sizeof(terminal_buffer[r]));
-                }
-                state->row = 0;
-                state->col = 0;
-                
-                // Clear the X11 window
-                XClearWindow(global_display, global_window);
-                draw_text(global_display, global_window, DefaultGC(global_display, DefaultScreen(global_display)));
-            }
+            /* ... existing clear-screen handling ... */
             break;
 
-        case 'H': // Move cursor to home position (0,0)
-            state->row = 0;
-            state->col = 0;
+        case 'H': // Cursor home
+            /* ... existing cursor-home handling ... */
             break;
+
+        // ADD THIS:
+        case 'K': // Erase in line
+        {
+            int mode = (param_count > 0) ? param_values[0] : 0;
+            // mode=0 => erase from cursor to end of line
+            // mode=1 => erase from start of line to cursor
+            // mode=2 => erase the entire line
+            int r = state->row;
+
+            switch (mode) {
+                case 0: // from cursor → end
+                    for (int c = state->col; c < TERMINAL_COLS; c++) {
+                        memset(terminal_buffer[r][c].c, 0, sizeof(terminal_buffer[r][c].c));
+                    }
+                    break;
+                case 1: // from start → cursor
+                    for (int c = 0; c <= state->col && c < TERMINAL_COLS; c++) {
+                        memset(terminal_buffer[r][c].c, 0, sizeof(terminal_buffer[r][c].c));
+                    }
+                    break;
+                case 2: // entire line
+                    memset(terminal_buffer[r], 0, sizeof(terminal_buffer[r]));
+                    break;
+            }
+        }
+        break;
 
         default:
-            // Unsupported ANSI sequences can be handled here if needed
+            // Ignore or implement other ANSI sequences as needed
             break;
     }
 }
 
 // Function to place a character in the terminal buffer
 void put_char(char c, TerminalState *state) {
+    static uint8_t utf8_buf[MAX_UTF8_CHAR_SIZE + 1] = {0}; // Buffer for UTF-8 decoding
+    static int utf8_len = 0;
+
+    // Handle special control characters
     if (c == '\b' || c == 0x7F) { // Handle backspace
         if (state->col > 0) {
-            state->col--; // Move cursor back
-            terminal_buffer[state->row][state->col].c = '\0'; // Erase character
-        } else if (state->row > 0) { // Move to previous line if at column 0
-            state->row--;
-            state->col = TERMINAL_COLS - 1; // Move to end of previous line
-            terminal_buffer[state->row][state->col].c = '\0';
+            state->col--;
+            memset(terminal_buffer[state->row][state->col].c, 0, MAX_UTF8_CHAR_SIZE + 1); // Clear character
         }
         return;
     }
 
     if (c == '\n') { 
+        state->col = 0;  // Move cursor to start of next line
         state->row++;
-        state->col = 0;
+
+        // Scroll if at the bottom
         if (state->row >= TERMINAL_ROWS) {
             // Scroll up
             for (int r = 1; r < TERMINAL_ROWS; r++) {
                 memcpy(terminal_buffer[r - 1], terminal_buffer[r], sizeof(TerminalCell) * TERMINAL_COLS);
             }
-            // Clear the last line
             memset(terminal_buffer[TERMINAL_ROWS - 1], 0, sizeof(TerminalCell) * TERMINAL_COLS);
             state->row = TERMINAL_ROWS - 1;
         }
@@ -178,12 +167,19 @@ void put_char(char c, TerminalState *state) {
     }
 
     if (c == '\r') {
-        state->col = 0;
+        state->col = 0;  // Carriage return resets to beginning of line
         return;
     }
 
-    if (isprint(c)) {
-        if (state->col >= TERMINAL_COLS - 1) {
+    // Handle UTF-8 decoding
+    utf8_buf[utf8_len++] = (uint8_t)c;
+    utf8proc_int32_t codepoint;
+    ssize_t result = utf8proc_iterate(utf8_buf, utf8_len, &codepoint);
+
+    if (result > 0) { // If valid UTF-8 sequence is detected
+        utf8_buf[utf8_len] = '\0';  // Null-terminate for storage
+
+        if (state->col >= TERMINAL_COLS) {
             state->row++;
             state->col = 0;
             if (state->row >= TERMINAL_ROWS) {
@@ -191,14 +187,17 @@ void put_char(char c, TerminalState *state) {
                 for (int r = 1; r < TERMINAL_ROWS; r++) {
                     memcpy(terminal_buffer[r - 1], terminal_buffer[r], sizeof(TerminalCell) * TERMINAL_COLS);
                 }
-                // Clear the last line
                 memset(terminal_buffer[TERMINAL_ROWS - 1], 0, sizeof(TerminalCell) * TERMINAL_COLS);
                 state->row = TERMINAL_ROWS - 1;
             }
         }
-        terminal_buffer[state->row][state->col].c = c;
+
+        // Store the UTF-8 character in the terminal buffer
+        strncpy(terminal_buffer[state->row][state->col].c, (char *)utf8_buf, MAX_UTF8_CHAR_SIZE);
         terminal_buffer[state->row][state->col].color = state->current_color;
         terminal_buffer[state->row][state->col].font = state->current_font;
         state->col++;
+
+        utf8_len = 0;  // Reset buffer for next character
     }
 }

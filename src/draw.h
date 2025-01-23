@@ -1,16 +1,15 @@
-// draw.h
-
 #ifndef DRAW_H
 #define DRAW_H
 
 #include <X11/Xlib.h>
 #include <Xft/Xft.h> // Include Xft for Unicode support
 
-// Declare xft_color and xft_font as extern
+// Declare global fonts
 extern XftColor xft_color;
-extern XftFont *xft_font;
-extern XftFont *xft_font_bold; // Declare bold font
-extern XftFont *xft_font_bold; // Declare bold font globally
+extern XftFont *xft_font;       // Normal font
+extern XftFont *xft_font_bold;  // Bold font
+extern XftFont *xft_font_emoji; // Emoji font
+
 extern Window global_window; // Declare global window
 extern Display *global_display; // Ensure display is also declared
 

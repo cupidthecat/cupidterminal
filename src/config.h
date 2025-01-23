@@ -2,7 +2,7 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
-#define FONT "undefined"
+#define FONT "Noto Sans Mono CJK, Noto Color Emoji-12"
 #define FONT_SIZE 12
 #define TERMINAL_WIDTH 80
 #define TERMINAL_HEIGHT 24

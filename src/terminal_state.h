@@ -9,10 +9,12 @@
 #define TERMINAL_COLS 80
 #define MAX_CHARS 4096
 
+#define MAX_UTF8_CHAR_SIZE 4  // UTF-8 characters can be up to 4 bytes
+
 typedef struct {
-    char c;                // The character
-    XftColor color;        // Foreground color
-    XftFont *font;         // Font (for bold, etc.)
+    char c[MAX_UTF8_CHAR_SIZE + 1]; // UTF-8 storage (plus null-terminator)
+    XftColor color;        
+    XftFont *font;         
 } TerminalCell;
 
 typedef struct {

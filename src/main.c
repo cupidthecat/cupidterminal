@@ -13,6 +13,8 @@
 #include <X11/Xutil.h>
 #include <signal.h>
 #include <sys/ioctl.h>
+#include <utf8proc.h> // unicode
+#include <stdint.h>
 #include "draw.h"
 #include "input.h"
 #include "config.h"
@@ -88,40 +90,37 @@ void spawn_shell() {
 }
 
 void handle_pty_output(Display *display, Window window, GC gc, TerminalState *state) {
-    char ch;
-    ssize_t num_read;
+    char buf[BUF_SIZE];
+    ssize_t num_read = read(master_fd, buf, BUF_SIZE - 1);
 
-    while ((num_read = read(master_fd, &ch, 1)) > 0) {
-        if (ch == '\033') { // ESC character
-            // Start of ANSI escape sequence
-            char seq[32];
-            int seq_len = 0;
-            seq[seq_len++] = ch;
+    if (num_read > 0) {
+        buf[num_read] = '\0';
 
-            // Read next character to confirm '['
-            if (read(master_fd, &ch, 1) > 0) {
-                seq[seq_len++] = ch;
-                if (ch == '[') {
-                    // Read until final byte (between '@' and '~')
-                    while (seq_len < (int)sizeof(seq) - 1 && read(master_fd, &ch, 1) > 0) {
-                        seq[seq_len++] = ch;
-                        if (ch >= '@' && ch <= '~') {
-                            break;
-                        }
-                    }
-                    // Handle the ANSI sequence
-                    handle_ansi_sequence(seq, seq_len, state, display);
-                } else {
-                    // Not supported; ignore or handle other sequences
-                }
-            }
-        } else {
-            // Regular character
-            put_char(ch, state);
+        // Remove unwanted escape sequences
+        char *seq;
+        while ((seq = strstr(buf, "\x1B[K")) != NULL) {
+            memmove(seq, seq + 3, strlen(seq + 3) + 1);  // Remove the sequence
         }
-    }
 
-    draw_text(display, window, gc); // Redraw with updated buffer
+        // Process remaining text normally
+        const uint8_t *ptr = (const uint8_t *)buf;
+        utf8proc_int32_t codepoint;
+        ssize_t char_size;
+
+        while (*ptr) {
+            char_size = utf8proc_iterate(ptr, -1, &codepoint);
+            if (char_size < 0) {
+                fprintf(stderr, "Invalid UTF-8 sequence.\n");
+                break;
+            }
+            for (int i = 0; i < char_size; i++) {
+                put_char(ptr[i], state);
+            }
+            ptr += char_size;
+        }
+
+        draw_text(display, window, gc);
+    }
 }
 
 int main() {
