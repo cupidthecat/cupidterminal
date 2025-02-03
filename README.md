@@ -42,7 +42,7 @@ make
 
 ## Usage
 
-Run CupidTerminal:
+Run cupidterminal:
 
 ```bash
 ./cupidterminal
@@ -52,7 +52,7 @@ Run CupidTerminal:
 
 ## Configuration
 
-Customize CupidTerminal by modifying the `config.h` file. Key configuration options include:
+Customize cupidterminal by modifying the `config.h` file. Key configuration options include:
 
 ```c
 #define FONT "monospace"       // Font family
