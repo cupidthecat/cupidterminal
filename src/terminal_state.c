@@ -91,17 +91,56 @@ void handle_ansi_sequence(const char *seq, int len, TerminalState *state, Displa
     }
 
     switch (cmd) {
-        case 'm': // SGR
-            /* ... existing color/bold handling ... */
-            break;
-
-        case 'J': // Clear screen
-            /* ... existing clear-screen handling ... */
-            break;
-
-        case 'H': // Cursor home
-            /* ... existing cursor-home handling ... */
-            break;
+        case 'm': { // SGR (colors, bold, reset)
+            if (param_count == 0) { // reset
+                reset_attributes(state, xft_color, xft_font);
+                break;
+            }
+            for (int i = 0; i < param_count; i++) {
+                int p = param_values[i];
+                if (p == 0) {
+                    reset_attributes(state, xft_color, xft_font);
+                } else if (p == 1) { // bold on
+                    state->current_font = xft_font_bold ? xft_font_bold : xft_font;
+                } else if (p == 22) { // normal intensity
+                    state->current_font = xft_font;
+                } else if (p >= 30 && p <= 37) {
+                    allocate_color(global_display, state, p);
+                } else if (p == 39) { // default fg
+                    state->current_color = xft_color;
+                } else if (p >= 90 && p <= 97) { // bright fg → map to normal codes for now
+                    allocate_color(global_display, state, (p - 90) + 30);
+                }
+                // (You can add 3/4/8-bit/24-bit color later)
+            }
+        } break;
+        
+        case 'J': { // Erase in display
+            int mode = (param_count > 0) ? param_values[0] : 0;
+            if (mode == 2) { // entire screen
+                for (int r = 0; r < TERMINAL_ROWS; r++)
+                    memset(terminal_buffer[r], 0, sizeof(terminal_buffer[r]));
+                state->row = 0; state->col = 0;
+            } else if (mode == 0) { // cursor → end
+                for (int c = state->col; c < TERMINAL_COLS; c++)
+                    memset(terminal_buffer[state->row][c].c, 0, sizeof(terminal_buffer[state->row][c].c));
+                for (int r = state->row + 1; r < TERMINAL_ROWS; r++)
+                    memset(terminal_buffer[r], 0, sizeof(terminal_buffer[r]));
+            } else if (mode == 1) { // start → cursor
+                for (int r = 0; r < state->row; r++)
+                    memset(terminal_buffer[r], 0, sizeof(terminal_buffer[r]));
+                for (int c = 0; c <= state->col && c < TERMINAL_COLS; c++)
+                    memset(terminal_buffer[state->row][c].c, 0, sizeof(terminal_buffer[state->row][c].c));
+            }
+        } break;
+        
+        case 'H': // CUP (move cursor; 1-based)
+        case 'f': {
+            int r = (param_count >= 1 && param_values[0] > 0) ? param_values[0] : 1;
+            int c = (param_count >= 2 && param_values[1] > 0) ? param_values[1] : 1;
+            state->row = (r - 1 < TERMINAL_ROWS) ? (r - 1) : (TERMINAL_ROWS - 1);
+            state->col = (c - 1 < TERMINAL_COLS) ? (c - 1) : (TERMINAL_COLS - 1);
+        } break;
 
         // ADD THIS:
         case 'K': // Erase in line
