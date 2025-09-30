@@ -102,21 +102,48 @@ void handle_pty_output(Display *display, Window window, GC gc, TerminalState *st
             memmove(seq, seq + 3, strlen(seq + 3) + 1);  // Remove the sequence
         }
 
-        // Process remaining text normally
-        const uint8_t *ptr = (const uint8_t *)buf;
-        utf8proc_int32_t codepoint;
-        ssize_t char_size;
+        const uint8_t *p = (const uint8_t *)buf;
+        while (*p) {
+            if (*p == 0x1B) { // ESC
+                const uint8_t *start = p++;
+                if (*p == '[') {
+                    // CSI: ESC [ ... <final>
+                    p++;
+                    const uint8_t *q = p;
+                    while (*q && !((*q >= '@' && *q <= '~'))) q++; // final byte
+                    if (*q) {
+                        int len = (int)((q - 1) - start + 2); // include ESC '[' ... final
+                        handle_ansi_sequence((const char*)start, len, state, display);
+                        p = q + 1;
+                        continue;
+                    } else {
+                        // incomplete; bail out and print raw
+                        p = start;
+                    }
+                } else if (*p == ']') {
+                    // OSC: ESC ] ... BEL(0x07) or ST (ESC \)
+                    p++;
+                    while (*p && *p != 0x07) {
+                        if (*p == 0x1B && *(p+1) == '\\') { p += 2; break; } // ST
+                        p++;
+                    }
+                    if (*p == 0x07) p++; // skip BEL
+                    continue; // drop OSC entirely
+                } else {
+                    // some other ESC sequence; ignore it
+                    continue;
+                }
+            }
 
-        while (*ptr) {
-            char_size = utf8proc_iterate(ptr, -1, &codepoint);
-            if (char_size < 0) {
-                fprintf(stderr, "Invalid UTF-8 sequence.\n");
-                break;
+            // tabs → spaces (simple 4-space expansion)
+            if (*p == '\t') {
+                for (int i = 0; i < 4; i++) put_char(' ', state);
+                p++;
+                continue;
             }
-            for (int i = 0; i < char_size; i++) {
-                put_char(ptr[i], state);
-            }
-            ptr += char_size;
+
+            // normal UTF-8 byte goes through the decoder in put_char
+            put_char(*p++, state);
         }
 
         draw_text(display, window, gc);
