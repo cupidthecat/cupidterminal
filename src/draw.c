@@ -3,6 +3,7 @@
 #include <X11/Xft/Xft.h>
 #include <utf8proc.h> // unicode
 #include <string.h>
+#include <stdio.h>
 #include "draw.h"
 #include "config.h"
 #include "terminal_state.h"
@@ -14,15 +15,26 @@
 // char terminal_buffer[MAX_LINES][MAX_CHARS]; // Now defined in terminal_state.c
 int line_count = 0;  // Track number of lines
 
+// Static constants
+static const int LEFT_PAD = 10;
+static const int LINE_GAP = 2;
+static void sel_norm_bounds(int *sr, int *sc, int *er, int *ec);
+static int cell_selected(int r, int c);
+
 // Global variables
 XftDraw *xft_draw = NULL;
 XftFont *xft_font = NULL;
 XftFont *xft_font_bold = NULL;
 XftFont *xft_font_emoji = NULL;  // <-- Add this line
 XftColor xft_color;
+XftColor xft_color_fg;   // white text
+XftColor xft_color_bg;   // black background
+
 Display *global_display = NULL;
 Window global_window = 0;
-
+int g_cell_w = 0;
+int g_cell_h = 0;
+int g_cell_gap = 1;
 
 // Initialize Xft for Unicode and emoji support
 void initialize_xft(Display *display, Window window) {
@@ -30,7 +42,9 @@ void initialize_xft(Display *display, Window window) {
     global_window = window;
 
     // Initialize XftDraw
-    xft_draw = XftDrawCreate(display, window, DefaultVisual(display, DefaultScreen(display)), DefaultColormap(display, DefaultScreen(display)));
+    xft_draw = XftDrawCreate(display, window, 
+        DefaultVisual(display, DefaultScreen(display)), 
+        DefaultColormap(display, DefaultScreen(display)));
     if (!xft_draw) {
         fprintf(stderr, "Failed to create XftDraw.\n");
         exit(EXIT_FAILURE);
@@ -73,17 +87,32 @@ void initialize_xft(Display *display, Window window) {
         xft_font_bold = xft_font;
     }
 
-    // Allocate default text color (black)
-    XRenderColor render_color = {0, 0, 0, 65535};
+    // Allocate WHITE (foreground)
+    XRenderColor rc_white = {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF};
     if (!XftColorAllocValue(display, DefaultVisual(display, DefaultScreen(display)),
-                            DefaultColormap(display, DefaultScreen(display)),
-                            &render_color, &xft_color)) {
-        fprintf(stderr, "Failed to allocate XftColor.\n");
+            DefaultColormap(display, DefaultScreen(display)),
+            &rc_white, &xft_color_fg)) {
+        fprintf(stderr, "Failed to allocate white color.\n");
         exit(EXIT_FAILURE);
     }
 
-    // Initialize terminal state with normal text font
-    initialize_terminal_state(&term_state, xft_color, xft_font);
+    // Allocate BLACK (background)
+    XRenderColor rc_black = {0x0000, 0x0000, 0x0000, 0xFFFF};
+    if (!XftColorAllocValue(display, DefaultVisual(display, DefaultScreen(display)),
+            DefaultColormap(display, DefaultScreen(display)),
+            &rc_black, &xft_color_bg)) {
+        fprintf(stderr, "Failed to allocate black color.\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // Compute cell size (keep your M-measure)
+    XGlyphInfo extM;
+    XftTextExtentsUtf8(display, xft_font, (const FcChar8*)"M", 1, &extM);
+    g_cell_w = extM.xOff > 0 ? extM.xOff : xft_font->max_advance_width;
+    g_cell_h = xft_font->ascent + xft_font->descent;
+
+    // IMPORTANT: initialize with the REAL foreground (white)
+    initialize_terminal_state(&term_state, xft_color_fg, xft_font);
 }
 
 // Cleanup Xft resources
@@ -99,47 +128,104 @@ void cleanup_xft() {
 
 // Draw text using TerminalState's current color per character
 void draw_text(Display *display, Window window, GC gc) {
+    (void)gc;
     XClearWindow(display, window);
 
-    int y_offset = xft_font->ascent + 5;
+    const int left_pad = LEFT_PAD;
+    const int line_gap = LINE_GAP;
+    const int baseline0 = xft_font->ascent + 5;
+    const int step_w = g_cell_w + g_cell_gap;   // <- cell width + gap
+
     for (int r = 0; r < TERMINAL_ROWS; r++) {
-        int x_offset = 10;
+        int x = LEFT_PAD;
+        int y = baseline0 + r * (g_cell_h + LINE_GAP);
+    
         for (int c = 0; c < TERMINAL_COLS; c++) {
-            if (terminal_buffer[r][c].c[0] != '\0') {
-                utf8proc_int32_t codepoint;
-                ssize_t char_size = utf8proc_iterate((uint8_t *)terminal_buffer[r][c].c, -1, &codepoint);
-
-                // Use emoji font if it's an emoji
-                XftFont *font_to_use = xft_font;
-                // Use emoji font for a wider range of emoji codepoints
-                if ((codepoint >= 0x1F300 && codepoint <= 0x1F5FF) ||  // Miscellaneous Symbols and Pictographs
-                    (codepoint >= 0x1F600 && codepoint <= 0x1F64F) ||  // Emoticons
-                    (codepoint >= 0x1F680 && codepoint <= 0x1F6FF) ||  // Transport & Map
-                    (codepoint >= 0x1F900 && codepoint <= 0x1FAFF) ||  // Supplemental Symbols and Pictographs
-                    (codepoint >= 0x2600 && codepoint <= 0x26FF) ||    // Miscellaneous Symbols (some emojis here)
-                    (codepoint >= 0x2700 && codepoint <= 0x27BF) ||    // Dingbats (checkmarks, crosses, etc.)
-                    (codepoint >= 0xFE00 && codepoint <= 0xFE0F) ||    // Variation Selectors (for emoji styling)
-                    (codepoint >= 0x1F1E6 && codepoint <= 0x1F1FF)) {  // Regional Indicator Symbols (Flags)
-                    
-                    font_to_use = xft_font_emoji;
-                }
-
-                XftDrawStringUtf8(
-                    xft_draw,
-                    &terminal_buffer[r][c].color,
-                    font_to_use,
-                    x_offset,
-                    y_offset,
-                    (const FcChar8 *)terminal_buffer[r][c].c,
-                    strlen(terminal_buffer[r][c].c)
-                );
-
-                XGlyphInfo extents;
-                XftTextExtentsUtf8(display, font_to_use, (const FcChar8 *)terminal_buffer[r][c].c, 
-                                   strlen(terminal_buffer[r][c].c), &extents);
-                x_offset += extents.xOff;
+            int selected = cell_selected(r, c);
+            if (selected) {
+                // Selection rectangle behind the cell
+                int top = y - xft_font->ascent;
+                XftDrawRect(xft_draw, &xft_color_fg, x, top, g_cell_w, g_cell_h);
             }
+    
+            if (terminal_buffer[r][c].c[0] != '\0') {
+                utf8proc_int32_t cp;
+                ssize_t rs = utf8proc_iterate((uint8_t*)terminal_buffer[r][c].c, -1, &cp);
+                if (rs > 0) {
+                    XftFont *font_to_use = xft_font;
+                    // (emoji coverage kept as-is)
+                    if ((cp >= 0x1F300 && cp <= 0x1F5FF) ||
+                        (cp >= 0x1F600 && cp <= 0x1F64F) ||
+                        (cp >= 0x1F680 && cp <= 0x1F6FF) ||
+                        (cp >= 0x1F900 && cp <= 0x1FAFF) ||
+                        (cp >= 0x2600  && cp <= 0x26FF)  ||
+                        (cp >= 0x2700  && cp <= 0x27BF)  ||
+                        (cp >= 0xFE00  && cp <= 0xFE0F)  ||
+                        (cp >= 0x1F1E6 && cp <= 0x1F1FF)) {
+                        font_to_use = xft_font_emoji;
+                    }
+    
+                    // Invert fg when selected: black on white
+                    XftColor *fg = selected ? &xft_color_bg : &terminal_buffer[r][c].color;
+                    XftDrawStringUtf8(xft_draw, fg, font_to_use, x, y,
+                        (const FcChar8*)terminal_buffer[r][c].c,
+                        strlen(terminal_buffer[r][c].c));
+                }
+            }
+            x += step_w;
         }
-        y_offset += xft_font->ascent + xft_font->descent + 2;
     }
+
+    // Caret in the GAP between columns (never over a glyph)
+    {
+        int gap_x = left_pad + term_state.col * step_w - g_cell_gap; // gap BEFORE current cell
+        if (term_state.col == 0) gap_x = left_pad;                    // at left margin
+
+        int cy_top = baseline0 + term_state.row * (g_cell_h + line_gap) - xft_font->ascent;
+
+        XSetForeground(display, DefaultGC(display, DefaultScreen(display)),
+                       WhitePixel(display, DefaultScreen(display)));
+        XFillRectangle(display, window, DefaultGC(display, DefaultScreen(display)),
+                       gap_x, cy_top, g_cell_gap, g_cell_h);
+    }
+}
+
+void xy_to_cell(int x, int y, int *row, int *col) {
+    const int baseline0 = xft_font->ascent + 5;
+    const int step_w    = g_cell_w + g_cell_gap;
+    const int step_h    = g_cell_h + LINE_GAP;
+
+    int relx = x - LEFT_PAD;
+    if (relx < 0) relx = 0;
+    int c = relx / (step_w ? step_w : 1);
+
+    int top0 = baseline0 - xft_font->ascent;
+    int rely = y - top0;
+    int r = rely / (step_h ? step_h : 1);
+
+    if (r < 0) r = 0;
+    if (r >= TERMINAL_ROWS) r = TERMINAL_ROWS - 1;
+    if (c < 0) c = 0;
+    if (c >= TERMINAL_COLS) c = TERMINAL_COLS - 1;
+
+    *row = r; *col = c;
+}
+
+static void sel_norm_bounds(int *sr,int *sc,int *er,int *ec) {
+    int sidx = term_state.sel_anchor_row * TERMINAL_COLS + term_state.sel_anchor_col;
+    int eidx = term_state.sel_row       * TERMINAL_COLS + term_state.sel_col;
+    int ar = term_state.sel_anchor_row, ac = term_state.sel_anchor_col;
+    int br = term_state.sel_row,        bc = term_state.sel_col;
+    if (eidx < sidx) { int t; t=ar; ar=br; br=t; t=ac; ac=bc; bc=t; }
+    *sr = ar; *sc = ac; *er = br; *ec = bc;
+}
+
+static int cell_selected(int r,int c) {
+    if (!term_state.sel_active) return 0;
+    int sr,sc,er,ec; sel_norm_bounds(&sr,&sc,&er,&ec);
+    if (r < sr || r > er) return 0;
+    if (sr == er) return (c >= sc && c <= ec);
+    if (r == sr)  return (c >= sc);
+    if (r == er)  return (c <= ec);
+    return 1;
 }
