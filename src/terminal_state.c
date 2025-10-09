@@ -5,18 +5,16 @@
 #include <X11/Xft/Xft.h>
 #include <X11/Xlib.h>
 #include <utf8proc.h> // unicode
-
 #include "terminal_state.h"
 #include "draw.h"
 
 // External globals from draw.c
 extern Display *global_display;
 extern XftFont *xft_font;
-extern XftColor xft_color;
+extern XftColor xft_color_fg;
+
 TerminalState term_state;
 TerminalCell terminal_buffer[TERMINAL_ROWS][TERMINAL_COLS];
-
-
 
 // Initialize terminal state with default color and font
 void initialize_terminal_state(TerminalState *state, XftColor default_color, XftFont *default_font) {
@@ -32,10 +30,10 @@ void initialize_terminal_state(TerminalState *state, XftColor default_color, Xft
 }
 
 // Reset terminal attributes to default
-void reset_attributes(TerminalState *state, XftColor default_color, XftFont *default_font) {
-    state->current_color = default_color;
-    state->current_font = default_font;
-    // Reset other attributes if added
+// Reset terminal attributes to default
+void reset_attributes(TerminalState *s, XftColor default_color, XftFont *default_font) {
+    s->current_color = default_color;
+    s->current_font  = default_font;
 }
 
 void allocate_color(Display *display, TerminalState *state, int color_code) {
@@ -67,6 +65,31 @@ void allocate_background_color(Display *display, TerminalState *state, int color
     // TODO: Implement background color allocation
 }
 
+static XRenderColor map_xterm256(int n) {
+    // 0–15: ANSI; 16–231: 6x6x6 cube; 232–255: grayscale
+    XRenderColor xr = {0,0,0,0xFFFF};
+    if (n < 16) {
+        // reuse your allocate_color equivalents for 30–37/90–97
+        static const unsigned short ansi[16][3] = {
+            {0,0,0},{0x8000,0,0},{0,0x8000,0},{0x8000,0x8000,0},
+            {0,0,0x8000},{0x8000,0,0x8000},{0,0x8000,0x8000},{0xC000,0xC000,0xC000},
+            {0x4000,0x4000,0x4000},{0xFFFF,0,0},{0,0xFFFF,0},{0xFFFF,0xFFFF,0},
+            {0,0,0xFFFF},{0xFFFF,0,0xFFFF},{0,0xFFFF,0xFFFF},{0xFFFF,0xFFFF,0xFFFF}
+        };
+        xr.red = ansi[n][0]; xr.green = ansi[n][1]; xr.blue = ansi[n][2];
+        return xr;
+    } else if (n >= 16 && n <= 231) {
+        int idx = n - 16;
+        int r = idx / 36, g = (idx / 6) % 6, b = idx % 6;
+        unsigned short step[6] = {0, 0x3333, 0x6666, 0x9999, 0xCCCC, 0xFFFF};
+        xr.red = step[r]; xr.green = step[g]; xr.blue = step[b];
+        return xr;
+    } else {
+        unsigned short v = 0x0800 + (n - 232) * 0x0A8A; // approx 8..238
+        xr.red = xr.green = xr.blue = v;
+        return xr;
+    }
+}
 
 // Parse and handle ANSI escape sequences
 void handle_ansi_sequence(const char *seq, int len, TerminalState *state, Display *display) {
@@ -91,83 +114,73 @@ void handle_ansi_sequence(const char *seq, int len, TerminalState *state, Displa
     }
 
     switch (cmd) {
+        // Cursor movement
+        case 'A': { // CUU: move up N
+            int n = (param_count ? param_values[0] : 1);
+            state->row -= n; if (state->row < 0) state->row = 0;
+        } break;
+        case 'B': { // CUD: move down N
+            int n = (param_count ? param_values[0] : 1);
+            state->row += n; if (state->row >= TERMINAL_ROWS) state->row = TERMINAL_ROWS - 1;
+        } break;
+        case 'C': { // CUF
+            int n = (param_count ? param_values[0] : 1);
+            state->col += n;
+            if (state->col >= TERMINAL_COLS) state->col = TERMINAL_COLS - 1;
+        } break;
+        case 'D': { // CUB
+            int n = (param_count ? param_values[0] : 1);
+            state->col -= n;
+            if (state->col < 0) state->col = 0;
+        } break;        
+        case 's': { // save cursor
+            state->saved_row = state->row;
+            state->saved_col = state->col;
+        } break;
+        case 'u': { // restore cursor
+            if (state->saved_row >= 0) state->row = state->saved_row;
+            if (state->saved_col >= 0) state->col = state->saved_col;
+        } break;
+        
         case 'm': { // SGR (colors, bold, reset)
             if (param_count == 0) { // reset
-                reset_attributes(state, xft_color, xft_font);
+                reset_attributes(state, xft_color_fg, xft_font);
                 break;
             }
             for (int i = 0; i < param_count; i++) {
                 int p = param_values[i];
                 if (p == 0) {
-                    reset_attributes(state, xft_color, xft_font);
+                    state->current_color = xft_color_fg;
+                    state->current_font  = xft_font;
                 } else if (p == 1) { // bold on
                     state->current_font = xft_font_bold ? xft_font_bold : xft_font;
                 } else if (p == 22) { // normal intensity
                     state->current_font = xft_font;
                 } else if (p >= 30 && p <= 37) {
-                    allocate_color(global_display, state, p);
+                    allocate_color(display, state, p);
                 } else if (p == 39) { // default fg
-                    state->current_color = xft_color;
+                    state->current_color = xft_color_fg;
                 } else if (p >= 90 && p <= 97) { // bright fg → map to normal codes for now
-                    allocate_color(global_display, state, (p - 90) + 30);
+                    allocate_color(display, state, (p - 90) + 30);
+                } else if (p == 38 || p == 48) { // 24/256-bit selector
+                    // expect 38;5;n or 48;5;n
+                    if (i + 2 < param_count && param_values[i+1] == 5) {
+                        int n = param_values[i+2]; // 0..255
+                        // map 0..255 to an approximate XRenderColor and assign to fg/bg
+                        XRenderColor xr = map_xterm256(n);
+                        if (p == 38) XftColorAllocValue(display, DefaultVisual(display, DefaultScreen(display)),
+                                                        DefaultColormap(display, DefaultScreen(display)), &xr, &state->current_color);
+                        // (optional) store bg somewhere when you implement backgrounds
+                        i += 2; // consumed ";5;n"
+                    } else if (i + 4 < param_count && param_values[i+1] == 2) {
+                        // 24-bit (38;2;r;g;b) – you can implement later similarly
+                        i += 4;
+                    }
                 }
+                
                 // (You can add 3/4/8-bit/24-bit color later)
             }
         } break;
-        
-        case 'J': { // Erase in display
-            int mode = (param_count > 0) ? param_values[0] : 0;
-            if (mode == 2) { // entire screen
-                for (int r = 0; r < TERMINAL_ROWS; r++)
-                    memset(terminal_buffer[r], 0, sizeof(terminal_buffer[r]));
-                state->row = 0; state->col = 0;
-            } else if (mode == 0) { // cursor → end
-                for (int c = state->col; c < TERMINAL_COLS; c++)
-                    memset(terminal_buffer[state->row][c].c, 0, sizeof(terminal_buffer[state->row][c].c));
-                for (int r = state->row + 1; r < TERMINAL_ROWS; r++)
-                    memset(terminal_buffer[r], 0, sizeof(terminal_buffer[r]));
-            } else if (mode == 1) { // start → cursor
-                for (int r = 0; r < state->row; r++)
-                    memset(terminal_buffer[r], 0, sizeof(terminal_buffer[r]));
-                for (int c = 0; c <= state->col && c < TERMINAL_COLS; c++)
-                    memset(terminal_buffer[state->row][c].c, 0, sizeof(terminal_buffer[state->row][c].c));
-            }
-        } break;
-        
-        case 'H': // CUP (move cursor; 1-based)
-        case 'f': {
-            int r = (param_count >= 1 && param_values[0] > 0) ? param_values[0] : 1;
-            int c = (param_count >= 2 && param_values[1] > 0) ? param_values[1] : 1;
-            state->row = (r - 1 < TERMINAL_ROWS) ? (r - 1) : (TERMINAL_ROWS - 1);
-            state->col = (c - 1 < TERMINAL_COLS) ? (c - 1) : (TERMINAL_COLS - 1);
-        } break;
-
-        // ADD THIS:
-        case 'K': // Erase in line
-        {
-            int mode = (param_count > 0) ? param_values[0] : 0;
-            // mode=0 => erase from cursor to end of line
-            // mode=1 => erase from start of line to cursor
-            // mode=2 => erase the entire line
-            int r = state->row;
-
-            switch (mode) {
-                case 0: // from cursor → end
-                    for (int c = state->col; c < TERMINAL_COLS; c++) {
-                        memset(terminal_buffer[r][c].c, 0, sizeof(terminal_buffer[r][c].c));
-                    }
-                    break;
-                case 1: // from start → cursor
-                    for (int c = 0; c <= state->col && c < TERMINAL_COLS; c++) {
-                        memset(terminal_buffer[r][c].c, 0, sizeof(terminal_buffer[r][c].c));
-                    }
-                    break;
-                case 2: // entire line
-                    memset(terminal_buffer[r], 0, sizeof(terminal_buffer[r]));
-                    break;
-            }
-        }
-        break;
 
         default:
             // Ignore or implement other ANSI sequences as needed
@@ -232,7 +245,7 @@ void put_char(char c, TerminalState *state) {
         }
 
         // Store the UTF-8 character in the terminal buffer
-        strncpy(terminal_buffer[state->row][state->col].c, (char *)utf8_buf, MAX_UTF8_CHAR_SIZE);
+        memcpy(terminal_buffer[state->row][state->col].c, utf8_buf, (size_t)utf8_len + 1);
         terminal_buffer[state->row][state->col].color = state->current_color;
         terminal_buffer[state->row][state->col].font = state->current_font;
         state->col++;
