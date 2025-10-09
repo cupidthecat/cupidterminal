@@ -12,17 +12,49 @@
 extern Display *global_display;
 extern XftFont *xft_font;
 extern XftColor xft_color_fg;
+extern XftColor xft_color_bg;
 
 TerminalState term_state;
 TerminalCell terminal_buffer[TERMINAL_ROWS][TERMINAL_COLS];
 
+static XRenderColor map_ansi_color(int code) {
+    // Maps a 30-37, 40-47, 90-97, 100-107 code to an XRenderColor
+    int index = 0;
+    if (code >= 30 && code <= 37) index = code - 30;       // Standard FG
+    if (code >= 40 && code <= 47) index = code - 40;       // Standard BG
+    if (code >= 90 && code <= 97) index = code - 90 + 8;   // Bright FG
+    if (code >= 100 && code <= 107) index = code - 100 + 8; // Bright BG
+
+    static const unsigned short ansi[16][3] = {
+        {0x0000, 0x0000, 0x0000}, // 0: Black
+        {0xCCCC, 0x0000, 0x0000}, // 1: Red
+        {0x0000, 0xCCCC, 0x0000}, // 2: Green
+        {0xCCCC, 0xCCCC, 0x0000}, // 3: Yellow
+        {0x0000, 0x0000, 0xCCCC}, // 4: Blue
+        {0xCCCC, 0x0000, 0xCCCC}, // 5: Magenta
+        {0x0000, 0xCCCC, 0xCCCC}, // 6: Cyan
+        {0xCCCC, 0xCCCC, 0xCCCC}, // 7: White
+        {0x8080, 0x8080, 0x8080}, // 8: Bright Black (Gray)
+        {0xFFFF, 0x0000, 0x0000}, // 9: Bright Red
+        {0x0000, 0xFFFF, 0x0000}, // 10: Bright Green
+        {0xFFFF, 0xFFFF, 0x0000}, // 11: Bright Yellow
+        {0x0000, 0x0000, 0xFFFF}, // 12: Bright Blue
+        {0xFFFF, 0x0000, 0xFFFF}, // 13: Bright Magenta
+        {0x0000, 0xFFFF, 0xFFFF}, // 14: Bright Cyan
+        {0xFFFF, 0xFFFF, 0xFFFF}, // 15: Bright White
+    };
+    
+    return (XRenderColor){ansi[index][0], ansi[index][1], ansi[index][2], 0xFFFF};
+}
+
 // Initialize terminal state with default color and font
-void initialize_terminal_state(TerminalState *state, XftColor default_color, XftFont *default_font) {
+void initialize_terminal_state(TerminalState *state, XftColor default_fg, XftColor default_bg, XftFont *default_font) {
     state->row = 0;
     state->col = 0;
-    state->current_color = default_color;
+    state->current_color = default_fg;
+    state->current_bg_color = default_bg;
     state->current_font = default_font;
-
+    
     state->sel_active = 0;
     state->sel_anchor_row = 0;
     state->sel_anchor_col = 0;
@@ -30,10 +62,14 @@ void initialize_terminal_state(TerminalState *state, XftColor default_color, Xft
     state->sel_col = 0;
 
     for (int r = 0; r < TERMINAL_ROWS; r++) {
-        memset(terminal_buffer[r], 0, sizeof(terminal_buffer[r]));
+        for (int c = 0; c < TERMINAL_COLS; c++) {
+            memset(terminal_buffer[r][c].c, 0, MAX_UTF8_CHAR_SIZE + 1);
+            terminal_buffer[r][c].fg_color = default_fg;
+            terminal_buffer[r][c].bg_color = default_bg;
+            terminal_buffer[r][c].font = default_font;
+        }
     }
 }
-
 
 // Reset terminal attributes to default
 void reset_attributes(TerminalState *s, XftColor default_color, XftFont *default_font) {
@@ -192,42 +228,43 @@ void handle_ansi_sequence(const char *seq, int len, TerminalState *state, Displa
         } break;
         
         case 'm': { // SGR (colors, bold, reset)
-            if (param_count == 0) { // reset
-                reset_attributes(state, xft_color_fg, xft_font);
-                break;
+            if (param_count == 0) { // ESC[m is equivalent to ESC[0m
+                param_values[0] = 0;
+                param_count = 1;
             }
             for (int i = 0; i < param_count; i++) {
                 int p = param_values[i];
-                if (p == 0) {
+                if (p == 0) { // Reset all attributes
                     state->current_color = xft_color_fg;
+                    state->current_bg_color = xft_color_bg; // <-- FIX: Reset background
                     state->current_font  = xft_font;
-                } else if (p == 1) { // bold on
+                } else if (p == 1) { // Bold
                     state->current_font = xft_font_bold ? xft_font_bold : xft_font;
-                } else if (p == 22) { // normal intensity
+                } else if (p == 22) { // Normal intensity
                     state->current_font = xft_font;
-                } else if (p >= 30 && p <= 37) {
-                    allocate_color(display, state, p);
-                } else if (p == 39) { // default fg
+                } else if ((p >= 30 && p <= 37) || (p >= 90 && p <= 97)) { // FG Color
+                    XRenderColor xr = map_ansi_color(p);
+                    XftColorAllocValue(display, DefaultVisual(display, DefaultScreen(display)),
+                                       DefaultColormap(display, DefaultScreen(display)), &xr, &state->current_color);
+                } else if (p == 39) { // Default FG
                     state->current_color = xft_color_fg;
-                } else if (p >= 90 && p <= 97) { // bright fg → map to normal codes for now
-                    allocate_color(display, state, (p - 90) + 30);
-                } else if (p == 38 || p == 48) { // 24/256-bit selector
-                    // expect 38;5;n or 48;5;n
-                    if (i + 2 < param_count && param_values[i+1] == 5) {
-                        int n = param_values[i+2]; // 0..255
-                        // map 0..255 to an approximate XRenderColor and assign to fg/bg
+                } else if ((p >= 40 && p <= 47) || (p >= 100 && p <= 107)) { // <-- FIX: BG Color
+                    XRenderColor xr = map_ansi_color(p);
+                    XftColorAllocValue(display, DefaultVisual(display, DefaultScreen(display)),
+                                       DefaultColormap(display, DefaultScreen(display)), &xr, &state->current_bg_color);
+                } else if (p == 49) { // Default BG
+                    state->current_bg_color = xft_color_bg; // <-- FIX: Handle default BG
+                } else if (p == 38 || p == 48) { // 256-color or 24-bit color
+                    if (i + 2 < param_count && param_values[i+1] == 5) { // 256-color mode
+                        int n = param_values[i+2];
                         XRenderColor xr = map_xterm256(n);
-                        if (p == 38) XftColorAllocValue(display, DefaultVisual(display, DefaultScreen(display)),
-                                                        DefaultColormap(display, DefaultScreen(display)), &xr, &state->current_color);
-                        // (optional) store bg somewhere when you implement backgrounds
-                        i += 2; // consumed ";5;n"
-                    } else if (i + 4 < param_count && param_values[i+1] == 2) {
-                        // 24-bit (38;2;r;g;b) – you can implement later similarly
-                        i += 4;
+                        XftColor *target_color = (p == 38) ? &state->current_color : &state->current_bg_color;
+                        XftColorAllocValue(display, DefaultVisual(display, DefaultScreen(display)),
+                                           DefaultColormap(display, DefaultScreen(display)), &xr, target_color);
+                        i += 2; // Consume the next two parameters
                     }
+                    // You can add logic for 24-bit color (param_values[i+1] == 2) here later
                 }
-                
-                // (You can add 3/4/8-bit/24-bit color later)
             }
         } break;
 
@@ -302,7 +339,8 @@ void put_char(char c, TerminalState *state) {
 
         // Store the UTF-8 character in the terminal buffer
         memcpy(terminal_buffer[state->row][state->col].c, utf8_buf, (size_t)utf8_len + 1);
-        terminal_buffer[state->row][state->col].color = state->current_color;
+        terminal_buffer[state->row][state->col].fg_color = state->current_color;
+        terminal_buffer[state->row][state->col].bg_color = state->current_bg_color;
         terminal_buffer[state->row][state->col].font = state->current_font;
         state->col++;
 
