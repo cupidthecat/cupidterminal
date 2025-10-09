@@ -202,6 +202,12 @@ void put_char(char c, TerminalState *state) {
         return;
     }
 
+    // Handle bell (and other non-printing controls)
+    if (c == '\a') {                    // BEL (0x07)
+        XBell(global_display, 0);       // optional audible/visual bell
+        return;                         // do not draw a glyph
+    }
+    
     if (c == '\n') { 
         state->col = 0;  // Move cursor to start of next line
         state->row++;
