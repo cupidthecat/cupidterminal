@@ -12,9 +12,10 @@
 #define MAX_UTF8_CHAR_SIZE 4  // UTF-8 characters can be up to 4 bytes
 
 typedef struct {
-    char c[MAX_UTF8_CHAR_SIZE + 1]; // UTF-8 storage (plus null-terminator)
-    XftColor color;        
-    XftFont *font;         
+    char c[MAX_UTF8_CHAR_SIZE + 1];
+    XftColor fg_color;  // Rename from 'color'
+    XftColor bg_color;  // Add background color
+    XftFont *font;
 } TerminalCell;
 
 typedef struct {
@@ -22,6 +23,7 @@ typedef struct {
     int col;
     XftColor current_color;
     XftFont *current_font;
+    XftColor current_bg_color;
     int saved_row; int saved_col;
 
     // Selection tracking
@@ -38,7 +40,7 @@ extern TerminalState term_state;
 extern TerminalCell terminal_buffer[TERMINAL_ROWS][TERMINAL_COLS];
 
 // Function prototypes
-void initialize_terminal_state(TerminalState *state, XftColor default_color, XftFont *default_font);
+void initialize_terminal_state(TerminalState *state, XftColor default_fg, XftColor default_bg, XftFont *default_font);
 void reset_attributes(TerminalState *state, XftColor default_color, XftFont *default_font);
 void handle_ansi_sequence(const char *seq, int len, TerminalState *state, Display *display);
 void put_char(char c, TerminalState *state);  // Ensure this is declared
