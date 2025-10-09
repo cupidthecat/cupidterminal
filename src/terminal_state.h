@@ -22,7 +22,14 @@ typedef struct {
     int col;
     XftColor current_color;
     XftFont *current_font;
+    int saved_row; int saved_col;
+
+    // Selection tracking
+    int sel_active;
+    int sel_anchor_row, sel_anchor_col; // where drag started
+    int sel_row, sel_col;               // current drag end
 } TerminalState;
+
 
 // Declare the global TerminalState variable
 extern TerminalState term_state;
