@@ -97,7 +97,7 @@ Customize cupidterminal by modifying the `config.h` file. Key configuration opti
   - **Goal**: Enable copying and pasting text between the terminal and other applications
   - **Status**: Partially implemented with OSC 52 clipboard support in progress
 
-- [ ] Mouse Support
+- [X] Mouse Support
   - **Goal**: Add basic mouse interaction capabilities
   - **Status**: Planned feature for better user interaction
 
@@ -125,6 +125,7 @@ Customize cupidterminal by modifying the `config.h` file. Key configuration opti
     - `CSI J` (ED) erase in display: modes 0/1/2 (to end/start/entire screen)
   - **Where**: `src/terminal_state.c` in `handle_ansi_sequence`
   - **Action**: Clear `terminal_buffer` cells and reset attributes for the affected region(s); keep cursor rules per mode
+  - **Status**: Implemented in `terminal_state.c`
 
 - [ ] Alternate screen & cursor save/restore
   - **Goal**: Support full‑screen apps (vim/less) without polluting the main buffer
