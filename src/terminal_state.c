@@ -16,8 +16,6 @@ extern XftColor xft_color_fg;
 TerminalState term_state;
 TerminalCell terminal_buffer[TERMINAL_ROWS][TERMINAL_COLS];
 
-
-
 // Initialize terminal state with default color and font
 void initialize_terminal_state(TerminalState *state, XftColor default_color, XftFont *default_font) {
     state->row = 0;
@@ -25,13 +23,18 @@ void initialize_terminal_state(TerminalState *state, XftColor default_color, Xft
     state->current_color = default_color;
     state->current_font = default_font;
 
-    // Initialize terminal_buffer
+    state->sel_active = 0;
+    state->sel_anchor_row = 0;
+    state->sel_anchor_col = 0;
+    state->sel_row = 0;
+    state->sel_col = 0;
+
     for (int r = 0; r < TERMINAL_ROWS; r++) {
         memset(terminal_buffer[r], 0, sizeof(terminal_buffer[r]));
     }
 }
 
-// Reset terminal attributes to default
+
 // Reset terminal attributes to default
 void reset_attributes(TerminalState *s, XftColor default_color, XftFont *default_font) {
     s->current_color = default_color;
@@ -159,7 +162,7 @@ void handle_ansi_sequence(const char *seq, int len, TerminalState *state, Displa
                     memset(terminal_buffer[state->row][c].c, 0, MAX_UTF8_CHAR_SIZE + 1);
             }
         } break;
-        
+
         // Cursor movement
         case 'A': { // CUU: move up N
             int n = (param_count ? param_values[0] : 1);
