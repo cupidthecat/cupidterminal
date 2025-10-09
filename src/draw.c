@@ -112,7 +112,7 @@ void initialize_xft(Display *display, Window window) {
     g_cell_h = xft_font->ascent + xft_font->descent;
 
     // IMPORTANT: initialize with the REAL foreground (white)
-    initialize_terminal_state(&term_state, xft_color_fg, xft_font);
+    initialize_terminal_state(&term_state, xft_color_fg, xft_color_bg, xft_font);
 }
 
 // Cleanup Xft resources
@@ -142,9 +142,14 @@ void draw_text(Display *display, Window window, GC gc) {
     
         for (int c = 0; c < TERMINAL_COLS; c++) {
             int selected = cell_selected(r, c);
-            if (selected) {
-                // Selection rectangle behind the cell
-                int top = y - xft_font->ascent;
+            // Draw background (even if not selected)
+            int top = y - xft_font->ascent;
+            if (!selected) {
+                // Use the cell's background color
+                XftDrawRect(xft_draw, &terminal_buffer[r][c].bg_color, 
+                        x, top, g_cell_w, g_cell_h);
+            } else {
+                // Selection uses white background
                 XftDrawRect(xft_draw, &xft_color_fg, x, top, g_cell_w, g_cell_h);
             }
     
@@ -166,7 +171,7 @@ void draw_text(Display *display, Window window, GC gc) {
                     }
     
                     // Invert fg when selected: black on white
-                    XftColor *fg = selected ? &xft_color_bg : &terminal_buffer[r][c].color;
+                    XftColor *fg = selected ? &xft_color_bg : &terminal_buffer[r][c].fg_color;
                     XftDrawStringUtf8(xft_draw, fg, font_to_use, x, y,
                         (const FcChar8*)terminal_buffer[r][c].c,
                         strlen(terminal_buffer[r][c].c));
