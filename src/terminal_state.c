@@ -16,6 +16,8 @@ extern XftColor xft_color_fg;
 TerminalState term_state;
 TerminalCell terminal_buffer[TERMINAL_ROWS][TERMINAL_COLS];
 
+
+
 // Initialize terminal state with default color and font
 void initialize_terminal_state(TerminalState *state, XftColor default_color, XftFont *default_font) {
     state->row = 0;
@@ -114,6 +116,50 @@ void handle_ansi_sequence(const char *seq, int len, TerminalState *state, Displa
     }
 
     switch (cmd) {
+        case 'H':    // CUP: ESC[<row>;<col>H
+        case 'f': {  // HVP: same as CUP
+            int r = (param_count >= 1 && param_values[0] > 0) ? param_values[0] : 1;
+            int c = (param_count >= 2 && param_values[1] > 0) ? param_values[1] : 1;
+            r--; c--; // 1-based -> 0-based
+            if (r < 0) r = 0; if (r >= TERMINAL_ROWS) r = TERMINAL_ROWS - 1;
+            if (c < 0) c = 0; if (c >= TERMINAL_COLS) c = TERMINAL_COLS - 1;
+            state->row = r; state->col = c;
+        } break;
+
+        case 'J': {  // ED: erase display
+            int n = (param_count ? param_values[0] : 0);
+            if (n == 2 || n == 3) {               // whole screen (3 also clears scrollback; we have none)
+                for (int r = 0; r < TERMINAL_ROWS; r++)
+                    memset(terminal_buffer[r], 0, sizeof(terminal_buffer[r]));
+                state->row = 0; state->col = 0;   // home cursor
+            } else if (n == 0) {                  // cursor -> end of screen
+                // clear from cursor to end of line
+                for (int c = state->col; c < TERMINAL_COLS; c++)
+                    memset(terminal_buffer[state->row][c].c, 0, MAX_UTF8_CHAR_SIZE + 1);
+                // clear all following lines
+                for (int r = state->row + 1; r < TERMINAL_ROWS; r++)
+                    memset(terminal_buffer[r], 0, sizeof(terminal_buffer[r]));
+            } else if (n == 1) {                  // start -> cursor
+                for (int r = 0; r < state->row; r++)
+                    memset(terminal_buffer[r], 0, sizeof(terminal_buffer[r]));
+                for (int c = 0; c <= state->col && c < TERMINAL_COLS; c++)
+                    memset(terminal_buffer[state->row][c].c, 0, MAX_UTF8_CHAR_SIZE + 1);
+            }
+        } break;
+
+        case 'K': {  // EL: erase line
+            int n = (param_count ? param_values[0] : 0);
+            if (n == 2) {                          // entire line
+                memset(terminal_buffer[state->row], 0, sizeof(terminal_buffer[state->row]));
+            } else if (n == 0) {                   // cursor -> end of line
+                for (int c = state->col; c < TERMINAL_COLS; c++)
+                    memset(terminal_buffer[state->row][c].c, 0, MAX_UTF8_CHAR_SIZE + 1);
+            } else if (n == 1) {                   // start -> cursor
+                for (int c = 0; c <= state->col && c < TERMINAL_COLS; c++)
+                    memset(terminal_buffer[state->row][c].c, 0, MAX_UTF8_CHAR_SIZE + 1);
+            }
+        } break;
+        
         // Cursor movement
         case 'A': { // CUU: move up N
             int n = (param_count ? param_values[0] : 1);
@@ -208,6 +254,7 @@ void put_char(char c, TerminalState *state) {
         return;                         // do not draw a glyph
     }
     
+    // Handle newline
     if (c == '\n') { 
         state->col = 0;  // Move cursor to start of next line
         state->row++;
