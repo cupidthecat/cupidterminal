@@ -1,4 +1,5 @@
 // config.h
+// use cupidconf later
 #ifndef CONFIG_H
 #define CONFIG_H
 
@@ -9,7 +10,8 @@
 #define TERM "xterm-256color"
 #define UTF8_SUPPORT 1
 
-#define SHELL "/bin/sh" // Default shell; users can change this to their preferred shell
+#define SHELL "/bin/bash"
+ // Default shell; users can change this to their preferred shell
 
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
