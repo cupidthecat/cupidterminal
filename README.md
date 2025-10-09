@@ -118,7 +118,7 @@ Customize cupidterminal by modifying the `config.h` file. Key configuration opti
   - **Where**: Beside the OSC handling in `src/main.c` `handle_pty_output`
   - **Action**: Extract the `title` string and call `XStoreName(display, window, title)`
 
-- [ ] Erase sequences (CSI J/K)
+- [X] Erase sequences (CSI J/K)
   - **Goal**: Implement erasing behavior
   - **Protocol**:
     - `CSI K` (EL) erase in line: modes 0/1/2 (to end/start/entire line)
