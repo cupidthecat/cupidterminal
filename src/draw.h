@@ -17,5 +17,6 @@ void draw_text(Display *display, Window window, GC gc);
 void append_text(const char *text);
 void initialize_xft(Display *display, Window window);
 void cleanup_xft();
+void xy_to_cell(int x, int y, int *row, int *col);
 
 #endif // DRAW_H
