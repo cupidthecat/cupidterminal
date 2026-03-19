@@ -1,0 +1,10 @@
+# cupidterminal terminfo - based on xterm-256color
+# Supports: 256 colors, 24-bit truecolor, SGR mouse (1006), alternate screen,
+# cursor movement, bracketed paste, function keys, UTF-8
+#
+# Install: tic terminfo/cupidterminal.ti
+# Or: tic -x terminfo/cupidterminal.ti  (for extended capabilities)
+#
+cupidterminal-256color|cupidterminal|cupidterminal with 256 colors,
+	use=xterm-256color,
+	it#8,

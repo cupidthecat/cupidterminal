@@ -40,6 +40,18 @@ cd cupidterminal
 make
 ```
 
+For accurate capability reporting, install the terminfo entry and set `TERM=cupidterminal-256color` in config.h:
+
+```bash
+make install-terminfo
+```
+
+Then edit config.h and set `#define TERM "cupidterminal-256color"`. The default `xterm-256color` works without installation.
+
+### btop and TUI apps
+
+For btop and similar resource monitors, use a font with Braille (U+2800-U+28FF), box-drawing (U+2500-U+257F), and block elements (U+2580-U+259F). The default `DejaVu Sans Mono` includes these. If graphs look wrong, try `graph_symbol = "block"` in `~/.config/btop/btop.conf` or run btop with `btop -lc` for low-color mode.
+
 ## Usage
 
 Run cupidterminal:
@@ -167,7 +179,8 @@ Contributions are welcome! If you have ideas for improvements or bug fixes, plea
 - **main.c**: Handles initialization, event loop, PTY management, and integrates drawing and input handling.
 - **draw.c / draw.h**: Manages rendering text to the X11 window and maintaining the terminal buffer.
 - **input.h**: Declares input handling functions.
-- **config.h**: Contains configuration settings for fonts, terminal size, and other parameters.
+- **config.def.h**: Default configuration file, copied to `config.h` during build.
+- **config.h**: User's local configuration settings for fonts, terminal size, and other parameters.
 - **Makefile**: Build instructions for compiling the project.
 
 ## Acknowledgements

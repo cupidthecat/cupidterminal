@@ -1,6 +1,10 @@
 #ifndef DRAW_H
 #define DRAW_H
 
+/* Padding used for winsize calculation - must match draw.c */
+#define DRAW_LEFT_PAD 10
+#define DRAW_TOP_PAD  5
+
 #include <X11/Xlib.h>
 #include <Xft/Xft.h> // Include Xft for Unicode support
 
@@ -18,5 +22,7 @@ void append_text(const char *text);
 void initialize_xft(Display *display, Window window);
 void cleanup_xft();
 void xy_to_cell(int x, int y, int *row, int *col);
+void xft_zoom(Display *display, Window window, float delta);
+void xft_zoom_reset(Display *display, Window window);
 
 #endif // DRAW_H
