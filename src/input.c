@@ -16,6 +16,7 @@
 #include "draw.h"
 #include "config.h"
 #include "config_keys.h"
+#include <X11/Xutil.h>
 
 #define SNAP_WORD 1
 #define SNAP_LINE 2
@@ -494,10 +495,42 @@ void handle_keypress(Display *display, Window window, XEvent *event, int pty_fd)
     KeySym keysym;
     int len;
     unsigned int state;
+    Status xim_status;
 
     (void)display;
     (void)window;
-    len = XLookupString(&event->xkey, buffer, sizeof(buffer), &keysym, NULL);
+
+    if (g_xic) {
+        keysym = NoSymbol;
+        len = XmbLookupString(g_xic, &event->xkey, buffer, sizeof(buffer) - 1,
+                              &keysym, &xim_status);
+        if (len < 0) len = 0;
+        buffer[len] = '\0';
+        switch (xim_status) {
+        case XLookupNone:
+            /* IM consumed the event; it will deliver the result later via a
+               synthetic event.  Do not process this event further. */
+            return;
+        case XBufferOverflow:
+            len = 0;
+            keysym = XLookupKeysym(&event->xkey, 0);
+            break;
+        case XLookupChars:
+            /* XmbLookupString did not set keysym; resolve it separately so
+               shortcut and kmap checks work correctly. */
+            keysym = XLookupKeysym(&event->xkey, 0);
+            break;
+        case XLookupKeySym:
+        case XLookupBoth:
+            /* keysym (and possibly chars) already set by XmbLookupString. */
+            break;
+        default:
+            keysym = XLookupKeysym(&event->xkey, 0);
+            break;
+        }
+    } else {
+        len = XLookupString(&event->xkey, buffer, sizeof(buffer), &keysym, NULL);
+    }
     state = event->xkey.state;
     const Shortcut *bp;
     const char *customkey;
@@ -582,7 +615,11 @@ void handle_keypress(Display *display, Window window, XEvent *event, int pty_fd)
     if (keysym == XK_BackSpace) {
         tty_write(pty_fd, "\x7F", 1);
     } else if (keysym == XK_Return) {
-        tty_write(pty_fd, "\n", 1);
+        /* Send \r (carriage return), matching what a real keyboard generates
+           and what st sends.  In raw PTY mode, readline/zle binds \r to
+           accept-line; sending \n (Ctrl+J) can insert a literal newline and
+           show the PS2 continuation prompt instead. */
+        tty_write(pty_fd, "\r", 1);
     } else if ((event->xkey.state & Mod1Mask) && len > 0) {
         /* Alt/meta-as-escape: send ESC + unmodified character */
         tty_write(pty_fd, "\x1b", 1);

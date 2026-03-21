@@ -42,6 +42,146 @@ static Pixmap back_pixmap = None;
 static XftDraw *xft_draw_buf = NULL;
 static int back_w = 0, back_h = 0;
 
+/* XIM (X Input Method) state – mirrors st's ximopen/ximinstantiate design */
+static XIM g_xim = NULL;
+XIC g_xic = NULL;
+static XPoint g_xim_spot = {0, 0};
+
+/*
+ * Forward declaration: ximopen is registered as an XIDProc (instantiate callback)
+ * and also called from ximdestroy, so declare it before those.
+ */
+static void ximopen(Display *dpy, XPointer unused1, XPointer unused2);
+
+/*
+ * IC destroy callback – called by XIM when the input context is destroyed.
+ * XIM calls this as XIMProc(XIM, XPointer client, XPointer call).
+ */
+static void xicdestroy(XIM xim, XPointer client, XPointer call) {
+    (void)xim; (void)call;
+    Display *dpy = (Display *)client;
+    g_xic = NULL;
+    /* Re-register instantiate callback so we recover when the IM restarts */
+    XRegisterIMInstantiateCallback(dpy, NULL, NULL, NULL,
+                                   ximopen, (XPointer)dpy);
+}
+
+/*
+ * IM instantiate callback – called by X when an IM becomes available.
+ * Must match XIDProc = void(*)(Display*, XPointer, XPointer).
+ */
+static void ximopen(Display *dpy, XPointer unused1, XPointer unused2) {
+    (void)unused1; (void)unused2;
+    XIMCallback cb;
+    XVaNestedList spot_list;
+
+    if (g_xim)
+        return; /* already open */
+
+    g_xim = XOpenIM(dpy, NULL, NULL, NULL);
+    if (!g_xim) {
+        /* IM unavailable – leave g_xic NULL; fall back to XLookupString */
+        return;
+    }
+
+    /* Register IC destroy callback so we can recreate it if IM is destroyed */
+    cb.client_data = (XPointer)dpy;
+    cb.callback    = xicdestroy;
+    XSetIMValues(g_xim, XNDestroyCallback, &cb, NULL);
+
+    spot_list = XVaCreateNestedList(0, XNSpotLocation, &g_xim_spot, NULL);
+    g_xic = XCreateIC(g_xim,
+                      XNInputStyle,        XIMPreeditNothing | XIMStatusNothing,
+                      XNClientWindow,      global_window,
+                      XNFocusWindow,       global_window,
+                      XNPreeditAttributes, spot_list,
+                      NULL);
+    XFree(spot_list);
+
+    if (!g_xic) {
+        XCloseIM(g_xim);
+        g_xim = NULL;
+        return;
+    }
+
+    /* Successfully opened: unregister the instantiate callback */
+    XUnregisterIMInstantiateCallback(dpy, NULL, NULL, NULL,
+                                     ximopen, (XPointer)dpy);
+}
+
+/*
+ * IM destroy callback – called when the IM server dies.
+ * Must match XIMProc = void(*)(XIM, XPointer client, XPointer call).
+ */
+static void ximdestroy(XIM xim, XPointer client, XPointer call) {
+    (void)xim; (void)call;
+    Display *dpy = (Display *)client;
+    g_xim = NULL;
+    if (g_xic) {
+        XDestroyIC(g_xic);
+        g_xic = NULL;
+    }
+    /* Re-register instantiate callback to recover when IM restarts */
+    XRegisterIMInstantiateCallback(dpy, NULL, NULL, NULL,
+                                   ximopen, (XPointer)dpy);
+}
+
+/*
+ * xximspot – update the XIC preedit spot to the current cursor position so
+ * IME popup windows appear in the right place. Called after each draw_text().
+ *
+ * XSetICValues is an X11 round-trip; caching the last-sent position avoids
+ * calling it on every frame when the cursor hasn't moved (e.g. during btop
+ * redraws that don't move the cursor).
+ */
+void xximspot(Display *display, Window window) {
+    static int prev_col = -1, prev_row = -1;
+    XVaNestedList spot_list;
+    const int baseline0 = xft_font ? (xft_font->ascent + DRAW_TOP_PAD) : DRAW_TOP_PAD;
+    const int step_w    = g_cell_w + g_cell_gap;
+    const int step_h    = g_cell_h + LINE_GAP;
+    int cur_col, cur_row;
+
+    (void)window;
+    if (!g_xic || !display) return;
+
+    cur_col = term_state.col;
+    cur_row = term_state.row;
+
+    /* Skip the round-trip if the cursor hasn't moved */
+    if (cur_col == prev_col && cur_row == prev_row)
+        return;
+    prev_col = cur_col;
+    prev_row = cur_row;
+
+    g_xim_spot.x = (short)(LEFT_PAD + cur_col * step_w);
+    g_xim_spot.y = (short)(baseline0 + cur_row * step_h);
+
+    spot_list = XVaCreateNestedList(0, XNSpotLocation, &g_xim_spot, NULL);
+    XSetICValues(g_xic, XNPreeditAttributes, spot_list, NULL);
+    XFree(spot_list);
+}
+
+void xim_focus_in(void) {
+    if (g_xic)
+        XSetICFocus(g_xic);
+}
+
+void xim_focus_out(void) {
+    if (g_xic)
+        XUnsetICFocus(g_xic);
+}
+
+/* Cached window dimensions updated via draw_notify_resize() on ConfigureNotify.
+   Avoids an XGetWindowAttributes() round-trip on every frame. */
+static int cached_win_w = 0;
+static int cached_win_h = 0;
+
+void draw_notify_resize(int w, int h) {
+    cached_win_w = w;
+    cached_win_h = h;
+}
+
 #define COLOR_CACHE_SIZE (COLOR_DEFAULT_BG + 1)
 static XftColor color_cache[COLOR_CACHE_SIZE];
 static int color_allocated[COLOR_CACHE_SIZE] = {0};
@@ -169,6 +309,17 @@ sixd_to_16bit(int x)
 
 static XRenderColor get_xrender_color(uint32_t c, int is_bg, int is_faint) {
     XRenderColor xc;
+
+    /* Apply OSC dynamic-color overrides */
+    if (c == COLOR_DEFAULT_FG && term_state.osc_fg_color)
+        c = term_state.osc_fg_color;
+    else if (c == COLOR_DEFAULT_BG && term_state.osc_bg_color)
+        c = term_state.osc_bg_color;
+    else if (c == 256 && term_state.osc_cs_color) /* cursor */
+        c = term_state.osc_cs_color;
+    /* Apply OSC 4 per-index palette overrides */
+    else if (c < 256 && term_state.palette_overridden[c])
+        c = term_state.palette_override[c];
 
     if (COLOR_IS_TRUE_RGB(c)) {
         unsigned int r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
@@ -469,8 +620,26 @@ void initialize_xft(Display *display, Window window) {
 
     recompute_cell_metrics(display);
 
-    // IMPORTANT: initialize with the logic state
+    /* IMPORTANT: initialize with the logic state */
     initialize_terminal_state(&term_state);
+
+    /* Open XIM (or register a callback for when IM becomes available) */
+    if (!XSupportsLocale()) {
+        fprintf(stderr, "warning: X does not support locale\n");
+    } else {
+        XIMCallback cb;
+        ximopen(display, NULL, NULL);
+        if (!g_xim) {
+            /* IM not yet available; get notified when it starts */
+            XRegisterIMInstantiateCallback(display, NULL, NULL, NULL,
+                                           ximopen, (XPointer)display);
+        } else {
+            /* Register destroy callback so we re-open if IM server dies */
+            cb.client_data = (XPointer)display;
+            cb.callback    = ximdestroy;
+            XSetIMValues(g_xim, XNDestroyCallback, &cb, NULL);
+        }
+    }
 }
 
 static void xft_reload_fonts(Display *display) {
@@ -549,7 +718,9 @@ void xft_zoom_reset(Display *display, Window window) {
 }
 
 // Cleanup Xft resources
-void cleanup_xft() {
+void cleanup_xft(void) {
+    if (g_xic) { XDestroyIC(g_xic); g_xic = NULL; }
+    if (g_xim) { XCloseIM(g_xim);   g_xim = NULL; }
     clear_glyph_fallback_cache(global_display);
     if (xft_draw_buf) { XftDrawDestroy(xft_draw_buf); xft_draw_buf = NULL; }
     if (back_pixmap != None && global_display) {
@@ -636,6 +807,13 @@ static void resolve_cell_colors(uint32_t in_fg, uint32_t in_bg, uint16_t attrs, 
         fg += 8;
     }
 
+    /* DECSCNM: global screen reverse */
+    if (term_state.screen_reverse) {
+        uint32_t tmp = fg;
+        fg = bg;
+        bg = tmp;
+    }
+
     if (attrs & ATTR_REVERSE) {
         uint32_t tmp = fg;
         fg = bg;
@@ -657,6 +835,11 @@ static void resolve_cell_colors(uint32_t in_fg, uint32_t in_bg, uint16_t attrs, 
     *out_bg = bg;
 }
 
+/* Triggers a full clear+redraw on next draw_text() call (set after resize). */
+static int draw_full_refresh = 1;
+/* Tracks previous cursor row to dirty it when cursor moves between rows. */
+static int prev_cursor_row = -1;
+
 // Draw text using TerminalState's current attr per character
 void draw_text(Display *display, Window window, GC gc) {
     if (!xft_draw) return;
@@ -666,15 +849,25 @@ void draw_text(Display *display, Window window, GC gc) {
         term_state.bell_rung = 0;
     }
 
-    XWindowAttributes wa;
-    if (!XGetWindowAttributes(display, window, &wa)) return;
+    int win_w = cached_win_w;
+    int win_h = cached_win_h;
+
+    /* Fall back to XGetWindowAttributes only if dimensions not yet known. */
+    if (win_w <= 0 || win_h <= 0) {
+        XWindowAttributes wa;
+        if (!XGetWindowAttributes(display, window, &wa)) return;
+        win_w = wa.width;
+        win_h = wa.height;
+        cached_win_w = win_w;
+        cached_win_h = win_h;
+    }
 
     /* Resize back buffer if window size changed */
-    if (back_pixmap == None || back_w != wa.width || back_h != wa.height) {
+    if (back_pixmap == None || back_w != win_w || back_h != win_h) {
         if (xft_draw_buf) { XftDrawDestroy(xft_draw_buf); xft_draw_buf = NULL; }
         if (back_pixmap != None) { XFreePixmap(display, back_pixmap); back_pixmap = None; }
-        back_w = wa.width;
-        back_h = wa.height;
+        back_w = win_w;
+        back_h = win_h;
         if (back_w > 0 && back_h > 0) {
             back_pixmap = XCreatePixmap(display, window, back_w, back_h,
                 DefaultDepth(display, DefaultScreen(display)));
@@ -684,69 +877,223 @@ void draw_text(Display *display, Window window, GC gc) {
                     DefaultColormap(display, DefaultScreen(display)));
             }
         }
+        draw_full_refresh = 1;
     }
 
     XftDraw *draw = (xft_draw_buf != NULL) ? xft_draw_buf : xft_draw;
     if (draw == NULL) return;
 
-    /* Clear: fill with default background */
-    XftDrawRect(draw, &xft_color_bg, 0, 0, back_w > 0 ? back_w : wa.width, back_h > 0 ? back_h : wa.height);
-
     const int left_pad = LEFT_PAD;
     const int line_gap = LINE_GAP;
     const int baseline0 = xft_font->ascent + DRAW_TOP_PAD;
     const int step_w = g_cell_w + g_cell_gap;
+    const int buf_w = back_w > 0 ? back_w : win_w;
+    const int buf_h = back_h > 0 ? back_h : win_h;
+
+    /* Dirty the rows occupied by the cursor (old position + new position) so
+       the cursor shape is always erased/redrawn even when cell content is unchanged. */
+    int cursor_row = term_state.row;
+    if (cursor_row < 0) cursor_row = 0;
+    if (cursor_row >= term_rows) cursor_row = term_rows - 1;
+    if (dirty_rows) {
+        if (prev_cursor_row >= 0 && prev_cursor_row < term_rows)
+            dirty_rows[prev_cursor_row] = 1;
+        dirty_rows[cursor_row] = 1;
+    }
+
+    /* Check whether anything actually needs rendering. */
+    int any_dirty = draw_full_refresh;
+    if (!any_dirty && dirty_rows) {
+        for (int r = 0; r < term_rows; r++) {
+            if (dirty_rows[r]) { any_dirty = 1; break; }
+        }
+    } else if (!dirty_rows) {
+        any_dirty = 1;
+    }
+
+    if (!any_dirty) {
+        /* Nothing changed — skip the entire render. */
+        return;
+    }
+
+    /* On a full refresh, clear the entire back pixmap once (covers padding areas too). */
+    int full = draw_full_refresh;
+    draw_full_refresh = 0;
+    if (full) {
+        XftDrawRect(draw, &xft_color_bg, 0, 0, buf_w, buf_h);
+    }
 
     for (int r = 0; r < term_rows; r++) {
+        /* Skip rows that haven't changed (incremental update only). */
+        if (!full && dirty_rows && !dirty_rows[r])
+            continue;
+
         int x = LEFT_PAD;
-        int y = baseline0 + r * (g_cell_h + LINE_GAP);
+        int y = baseline0 + r * (g_cell_h + line_gap);
+        int row_top = y - xft_font->ascent;
 
-        for (int c = 0; c < term_cols; c++) {
-            const TerminalCell *cell = &terminal_buffer[r][c];
-            int cell_span = 1;
-            int top = y - xft_font->ascent;
-            int selected;
-            int draw_w;
-            uint32_t fg_val;
-            uint32_t bg_val;
-            XftColor *fg_color;
+        /* On incremental updates, clear just this row before redrawing it. */
+        if (!full) {
+            XftDrawRect(draw, &xft_color_bg, 0, row_top, buf_w, g_cell_h);
+        }
 
-            if (cell->is_continuation) {
-                x += step_w;
-                continue;
-            }
+        /*
+         * Pass 1: background run batching.
+         * Walk cells left→right, tracking current pixel x.  Consecutive cells
+         * that resolve to the same XftColor* pointer are merged into one rect.
+         * Continuation cells are skipped (their lead cell covers them).
+         */
+        {
+            int cur_px = LEFT_PAD;
+            int run_px = LEFT_PAD;
+            XftColor *run_bg_color = NULL;
 
-            if (cell->width == 2 && c + 1 < term_cols) {
-                cell_span = 2;
-            }
+            for (int c = 0; c <= term_cols; c++) {
+                XftColor *bg_color = NULL;
+                int cell_w_px = step_w;
 
-            selected = cell_selected(r, c) || (cell_span == 2 && cell_selected(r, c + 1));
-            resolve_cell_colors(cell->fg, cell->bg, cell->attrs, selected, &fg_val, &bg_val);
+                if (c < term_cols) {
+                    const TerminalCell *cell = &terminal_buffer[r][c];
+                    if (cell->is_continuation) {
+                        cur_px += step_w;
+                        continue;
+                    }
+                    int cell_span = (cell->width == 2 && c + 1 < term_cols) ? 2 : 1;
+                    int selected = cell_selected(r, c) || (cell_span == 2 && cell_selected(r, c + 1));
+                    uint32_t fg_val, bg_val;
+                    resolve_cell_colors(cell->fg, cell->bg, cell->attrs, selected, &fg_val, &bg_val);
+                    bg_color = get_xft_color(display, window, bg_val, 1, 0);
+                    cell_w_px = g_cell_w * cell_span + g_cell_gap * (cell_span - 1);
+                }
 
-            draw_w = g_cell_w * cell_span + g_cell_gap * (cell_span - 1);
-            XftDrawRect(draw, get_xft_color(display, window, bg_val, 1, 0), x, top, draw_w, g_cell_h);
+                /* Flush the current run when the color changes or we're past the last cell. */
+                if (run_bg_color != NULL && bg_color != run_bg_color) {
+                    XftDrawRect(draw, run_bg_color, run_px, row_top, cur_px - run_px, g_cell_h);
+                    run_px = cur_px;
+                    run_bg_color = NULL;
+                }
 
-            fg_color = get_xft_color(display, window, fg_val, 0, (cell->attrs & ATTR_FAINT) != 0);
-
-            if (cell->c[0] != '\0') {
-                utf8proc_int32_t cp;
-                ssize_t rs = utf8proc_iterate((const uint8_t *)cell->c, -1, &cp);
-                if (rs > 0) {
-                    XftFont *font_to_use = font_for_cell(cell->attrs, cp);
-                    XftDrawStringUtf8(draw, fg_color, font_to_use, x, y,
-                        (const FcChar8 *)cell->c,
-                        (int)strlen(cell->c));
+                if (c < term_cols) {
+                    if (run_bg_color == NULL) {
+                        run_px = cur_px;
+                        run_bg_color = bg_color;
+                    }
+                    cur_px += cell_w_px;
+                } else {
+                    /* End of row: flush final run. */
+                    if (run_bg_color != NULL && cur_px > run_px)
+                        XftDrawRect(draw, run_bg_color, run_px, row_top, cur_px - run_px, g_cell_h);
                 }
             }
+        }
 
-            if (cell->attrs & ATTR_UNDERLINE) {
-                XftDrawRect(draw, fg_color, x, top + xft_font->ascent + 1, draw_w, 1);
-            }
-            if (cell->attrs & ATTR_STRUCK) {
-                XftDrawRect(draw, fg_color, x, top + (2 * xft_font->ascent) / 3, draw_w, 1);
-            }
+        /*
+         * Pass 2: foreground text run batching.
+         * Accumulate consecutive non-continuation cells sharing the same font
+         * and fg XftColor pointer into a UTF-8 string, draw one call per run.
+         * Decorations (underline, strikethrough) are drawn per cell since they
+         * are cheap (single pixel rect) and rarely span many cells.
+         */
+        {
+            /* Text run accumulator. MAX_CHARS (4096) is larger than any terminal row. */
+            char run_buf[MAX_CHARS];
+            int run_buf_len = 0;
+            int run_x = LEFT_PAD;       /* pixel x where the current run starts */
+            XftFont *run_font = NULL;
+            XftColor *run_fg_color = NULL;
 
-            x += step_w;
+            /* Flush helper: draw accumulated run buffer, then reset. */
+#define FLUSH_TEXT_RUN() do { \
+    if (run_buf_len > 0 && run_font && run_fg_color) { \
+        XftDrawStringUtf8(draw, run_fg_color, run_font, run_x, y, \
+                          (const FcChar8 *)run_buf, run_buf_len); \
+        run_buf_len = 0; \
+    } \
+} while (0)
+
+            x = LEFT_PAD;
+            for (int c = 0; c < term_cols; c++) {
+                const TerminalCell *cell = &terminal_buffer[r][c];
+                int cell_span = 1;
+                int top = row_top;
+                int selected;
+                int draw_w;
+                uint32_t fg_val;
+                uint32_t bg_val;
+                XftColor *fg_color;
+
+                if (cell->is_continuation) {
+                    x += step_w;
+                    continue;
+                }
+
+                if (cell->width == 2 && c + 1 < term_cols)
+                    cell_span = 2;
+
+                selected = cell_selected(r, c) || (cell_span == 2 && cell_selected(r, c + 1));
+                resolve_cell_colors(cell->fg, cell->bg, cell->attrs, selected, &fg_val, &bg_val);
+                draw_w = g_cell_w * cell_span + g_cell_gap * (cell_span - 1);
+                fg_color = get_xft_color(display, window, fg_val, 0, (cell->attrs & ATTR_FAINT) != 0);
+
+                if (cell->c[0] != '\0') {
+                    utf8proc_int32_t cp;
+                    ssize_t rs = utf8proc_iterate((const uint8_t *)cell->c, -1, &cp);
+                    if (rs > 0) {
+                        XftFont *font_to_use = font_for_cell(cell->attrs, cp);
+                        int glyph_len = (int)strlen(cell->c);
+
+                        /* Wide chars break runs: draw at exact grid position to
+                           avoid advance-width mismatches with g_cell_w. */
+                        if (cell->width == 2) {
+                            FLUSH_TEXT_RUN();
+                            XftDrawStringUtf8(draw, fg_color, font_to_use, x, y,
+                                              (const FcChar8 *)cell->c, glyph_len);
+                            run_font = NULL;
+                            run_fg_color = NULL;
+                        } else {
+                            /* Start a new run if font or color changes. */
+                            if (font_to_use != run_font || fg_color != run_fg_color) {
+                                FLUSH_TEXT_RUN();
+                                run_font = font_to_use;
+                                run_fg_color = fg_color;
+                                run_x = x;
+                            } else if (run_buf_len == 0) {
+                                run_x = x;
+                            }
+
+                            /* Append cell's UTF-8 bytes to the run buffer. */
+                            if (run_buf_len + glyph_len < (int)sizeof(run_buf)) {
+                                memcpy(run_buf + run_buf_len, cell->c, (size_t)glyph_len);
+                                run_buf_len += glyph_len;
+                            } else {
+                                /* Buffer full: flush then start fresh. */
+                                FLUSH_TEXT_RUN();
+                                run_font = font_to_use;
+                                run_fg_color = fg_color;
+                                run_x = x;
+                                memcpy(run_buf, cell->c, (size_t)glyph_len);
+                                run_buf_len = glyph_len;
+                            }
+                        }
+                    }
+                } else {
+                    /* Empty cell breaks any active text run. */
+                    FLUSH_TEXT_RUN();
+                    run_font = NULL;
+                    run_fg_color = NULL;
+                }
+
+                /* Decorations are cheap; draw per-cell. */
+                if (cell->attrs & ATTR_UNDERLINE)
+                    XftDrawRect(draw, fg_color, x, top + xft_font->ascent + 1, draw_w, 1);
+                if (cell->attrs & ATTR_STRUCK)
+                    XftDrawRect(draw, fg_color, x, top + (2 * xft_font->ascent) / 3, draw_w, 1);
+
+                x += step_w;
+            }
+            /* Flush any remaining run at end of row. */
+            FLUSH_TEXT_RUN();
+#undef FLUSH_TEXT_RUN
         }
     }
 
@@ -824,6 +1171,11 @@ void draw_text(Display *display, Window window, GC gc) {
     if (back_pixmap != None && gc) {
         XCopyArea(display, back_pixmap, window, gc, 0, 0, back_w, back_h, 0, 0);
     }
+
+    /* Update cursor tracking and clear dirty flags for next frame. */
+    prev_cursor_row = cursor_row;
+    if (dirty_rows)
+        memset(dirty_rows, 0, (size_t)term_rows);
 }
 
 void xy_to_cell(int x, int y, int *row, int *col) {

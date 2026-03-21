@@ -29,6 +29,7 @@ int term_cols = 80;
 
 TerminalState term_state;
 TerminalCell **terminal_buffer = NULL;
+uint8_t *dirty_rows = NULL;
 
 static TerminalCell **primary_buffer = NULL;
 static TerminalCell **alternate_buffer = NULL;
@@ -223,6 +224,24 @@ static void cursor_home(TerminalState *state) {
     state->col = 0;
 }
 
+static void mark_row_dirty(int row) {
+    if (dirty_rows && row >= 0 && row < term_rows)
+        dirty_rows[row] = 1;
+}
+
+static void mark_rows_dirty(int top, int bottom) {
+    if (!dirty_rows) return;
+    if (top < 0) top = 0;
+    if (bottom >= term_rows) bottom = term_rows - 1;
+    for (int r = top; r <= bottom; r++)
+        dirty_rows[r] = 1;
+}
+
+static void mark_all_rows_dirty(void) {
+    if (dirty_rows)
+        memset(dirty_rows, 1, (size_t)term_rows);
+}
+
 static void clear_row_range(int row, int start_col, int end_col, const TerminalState *state) {
     if (!state || !terminal_buffer || row < 0 || row >= term_rows) {
         return;
@@ -248,6 +267,7 @@ static void clear_row_range(int row, int start_col, int end_col, const TerminalS
     for (int c = start_col; c <= end_col; c++) {
         clear_cell(&terminal_buffer[row][c], state);
     }
+    mark_row_dirty(row);
 }
 
 static void clear_screen_range(int start_row, int start_col, int end_row, int end_col, const TerminalState *state) {
@@ -272,6 +292,34 @@ static void clear_screen_range(int start_row, int start_col, int end_row, int en
     }
 }
 
+/*
+ * selscroll: adjust selection coordinates when scrolling, mirroring st's
+ * selscroll().  Called before the actual buffer scroll so row numbers are
+ * still valid for boundary checks.
+ */
+static void selscroll_adjust(TerminalState *state, int orig, int n) {
+    /* n > 0 = scroll up n lines (content moves up, rows decrease by n) */
+    if (!state->sel_active) return;
+
+    state->sel_anchor_row -= n;
+    state->sel_row        -= n;
+
+    /* If both ends fell off the top, clear selection */
+    if (state->sel_anchor_row < orig && state->sel_row < orig) {
+        state->sel_active = 0;
+        return;
+    }
+    /* Clamp to scrolling region */
+    if (state->sel_anchor_row < orig) {
+        state->sel_anchor_row = orig;
+        state->sel_anchor_col = 0;
+    }
+    if (state->sel_row < orig) {
+        state->sel_row = orig;
+        state->sel_col = 0;
+    }
+}
+
 static void scroll_up_one_line(TerminalState *state) {
     int top;
     int bottom;
@@ -286,10 +334,13 @@ static void scroll_up_one_line(TerminalState *state) {
         return;
     }
 
+    selscroll_adjust(state, top, 1);
+
     for (int r = top + 1; r <= bottom; r++) {
         memcpy(terminal_buffer[r - 1], terminal_buffer[r], (size_t)term_cols * sizeof(TerminalCell));
     }
     clear_row_range(bottom, 0, term_cols - 1, state);
+    mark_rows_dirty(top, bottom);
 }
 
 static void scroll_down_one_line(TerminalState *state) {
@@ -306,10 +357,14 @@ static void scroll_down_one_line(TerminalState *state) {
         return;
     }
 
+    /* Shift selection down (n = -1 → move rows up by -1 = down by 1) */
+    selscroll_adjust(state, top, -1);
+
     for (int r = bottom - 1; r >= top; r--) {
         memcpy(terminal_buffer[r + 1], terminal_buffer[r], (size_t)term_cols * sizeof(TerminalCell));
     }
     clear_row_range(top, 0, term_cols - 1, state);
+    mark_rows_dirty(top, bottom);
 }
 
 static void scroll_up_n_lines(TerminalState *state, int n) {
@@ -446,6 +501,7 @@ static void activate_alternate_screen(TerminalState *state) {
     clear_buffer_defaults(alternate_buffer);
     terminal_buffer = alternate_buffer;
     state->alt_screen_active = 1;
+    mark_all_rows_dirty();
     state->row = 0;
     state->col = 0;
     state->scroll_top = -1;
@@ -469,6 +525,7 @@ static void deactivate_alternate_screen(TerminalState *state) {
     state->scroll_bottom = state->alt_saved_scroll_bottom;
     state->utf8_len = 0;
     clamp_cursor(state);
+    mark_all_rows_dirty();
 }
 
 static int parse_csi_params(const char *body, int body_len, int *params, int max_params) {
@@ -583,6 +640,7 @@ static int append_combining_mark(int row, int col, const uint8_t *bytes, int byt
 
     memcpy(cell->c + cur_len, bytes, (size_t)byte_len);
     cell->c[cur_len + (size_t)byte_len] = '\0';
+    mark_row_dirty(row);
     return 1;
 }
 
@@ -632,6 +690,11 @@ static void advance_row_with_scroll(TerminalState *state) {
 static void wrap_to_next_line(TerminalState *state) {
     if (!state) {
         return;
+    }
+
+    /* Mark the last glyph on this line as soft-wrapped (st's ATTR_WRAP) */
+    if (terminal_buffer && state->row >= 0 && state->row < term_rows && term_cols > 0) {
+        terminal_buffer[state->row][term_cols - 1].attrs |= ATTR_WRAP;
     }
 
     state->col = 0;
@@ -750,6 +813,36 @@ static size_t osc52_decode_base64(const char *encoded, uint8_t *out, size_t out_
     return out_len;
 }
 
+/*
+ * Parse an X11 color specification into a packed 24-bit true-color value.
+ * Handles "#rrggbb", "rgb:RR/GG/BB", and 8-bit "#RRRRGGGGBBBB".
+ * Returns COLOR_TRUE_RGB_BASE | (r<<16)|(g<<8)|b, or 0 on failure.
+ */
+static uint32_t parse_x11_color(const char *spec) {
+    unsigned int r, g, b;
+    if (!spec || !*spec) return 0;
+    if (*spec == '#') {
+        size_t n = strlen(spec + 1);
+        if (n == 6) {
+            if (sscanf(spec + 1, "%02x%02x%02x", &r, &g, &b) == 3)
+                return COLOR_TRUE_RGB_BASE | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+        } else if (n == 12) {
+            unsigned int r4, g4, b4;
+            if (sscanf(spec + 1, "%04x%04x%04x", &r4, &g4, &b4) == 3)
+                return COLOR_TRUE_RGB_BASE | ((uint32_t)(r4 >> 8) << 16) |
+                       ((uint32_t)(g4 >> 8) << 8) | (b4 >> 8);
+        }
+    } else if (strncmp(spec, "rgb:", 4) == 0) {
+        if (sscanf(spec + 4, "%x/%x/%x", &r, &g, &b) == 3) {
+            if (r > 0xFF) r >>= 8;
+            if (g > 0xFF) g >>= 8;
+            if (b > 0xFF) b >>= 8;
+            return COLOR_TRUE_RGB_BASE | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+        }
+    }
+    return 0;
+}
+
 static void osc_finalize(TerminalState *state) {
     const char *payload;
     const char *semi;
@@ -782,6 +875,34 @@ static void osc_finalize(TerminalState *state) {
         memcpy(state->window_title, title, title_len);
         state->window_title[title_len] = '\0';
         state->title_dirty = 1;
+    } else if (cmd == 4) {
+        /* OSC 4;index;color – set palette entry */
+        const char *idx_end;
+        int idx;
+        uint32_t col;
+        idx = (int)strtol(arg1, (char **)&idx_end, 10);
+        if (idx_end > arg1 && *idx_end == ';' && idx >= 0 && idx < 256) {
+            const char *colstr = idx_end + 1;
+            if (strcmp(colstr, "?") != 0) {
+                col = parse_x11_color(colstr);
+                if (col) {
+                    state->palette_override[idx] = col;
+                    state->palette_overridden[idx] = 1;
+                    mark_all_rows_dirty();
+                }
+            }
+        }
+    } else if (cmd == 10 || cmd == 11 || cmd == 12) {
+        /* OSC 10/11/12;color – set fg/bg/cursor dynamic color */
+        if (strcmp(arg1, "?") != 0) {
+            uint32_t col = parse_x11_color(arg1);
+            if (col) {
+                if (cmd == 10)      state->osc_fg_color = col;
+                else if (cmd == 11) state->osc_bg_color = col;
+                else                state->osc_cs_color = col;
+                mark_all_rows_dirty();
+            }
+        }
     } else if (cmd == 52 && allowwindowops) {
         int ok = 0;
         size_t decoded_len;
@@ -794,6 +915,32 @@ static void osc_finalize(TerminalState *state) {
                 state->osc52_pending = 1;
             }
         }
+    } else if (cmd == 104) {
+        /* OSC 104;index – reset palette entry (or all if no arg) */
+        const char *p = arg1;
+        if (!*p) {
+            memset(state->palette_overridden, 0, sizeof(state->palette_overridden));
+            mark_all_rows_dirty();
+        } else {
+            while (*p) {
+                int idx = (int)strtol(p, (char **)&p, 10);
+                if (idx >= 0 && idx < 256) {
+                    state->palette_overridden[idx] = 0;
+                    state->palette_override[idx] = 0;
+                }
+                if (*p == ';') p++;
+            }
+            mark_all_rows_dirty();
+        }
+    } else if (cmd == 110) {
+        state->osc_fg_color = 0;
+        mark_all_rows_dirty();
+    } else if (cmd == 111) {
+        state->osc_bg_color = 0;
+        mark_all_rows_dirty();
+    } else if (cmd == 112) {
+        state->osc_cs_color = 0;
+        mark_all_rows_dirty();
     }
 
     osc_reset(state);
@@ -851,6 +998,7 @@ static void terminal_soft_reset(TerminalState *state) {
     if (tab_stops) {
         init_default_tab_stops(tab_stops, term_cols);
     }
+    mark_all_rows_dirty();
 }
 
 void resize_terminal(int new_rows, int new_cols) {
@@ -891,6 +1039,11 @@ void resize_terminal(int new_rows, int new_cols) {
     alternate_buffer = new_alt;
     term_rows = new_rows;
     term_cols = new_cols;
+
+    /* Reallocate dirty_rows; mark all rows dirty after resize. */
+    free(dirty_rows);
+    dirty_rows = calloc((size_t)new_rows, sizeof(uint8_t));
+    if (dirty_rows) memset(dirty_rows, 1, (size_t)new_rows);
 
     new_tabs = calloc((size_t)new_cols, sizeof(unsigned char));
     if (new_tabs) {
@@ -952,6 +1105,8 @@ void initialize_terminal_state(TerminalState *state) {
         free(tab_stops);
         tab_stops = NULL;
     }
+    free(dirty_rows);
+    dirty_rows = NULL;
     terminal_buffer = NULL;
 
     term_rows = 24;
@@ -972,6 +1127,7 @@ void initialize_terminal_state(TerminalState *state) {
     state->alt_saved_scroll_top = -1;
     state->alt_saved_scroll_bottom = -1;
     state->title_dirty = 0;
+    state->utf8_mode = 1;
     strncpy(state->window_title, "cupidterminal", sizeof(state->window_title) - 1);
 
     resize_terminal(24, 80);
@@ -1052,6 +1208,15 @@ void handle_ansi_sequence(const char *seq, int len, TerminalState *state,
             if (csi_has_param(param_values, param_count, 1)) {
                 state->application_cursor_keys = 1;
             }
+            if (csi_has_param(param_values, param_count, 5)) {
+                if (!state->screen_reverse) {
+                    state->screen_reverse = 1;
+                    mark_all_rows_dirty();
+                }
+            }
+            if (csi_has_param(param_values, param_count, 1004)) {
+                state->focus_mode = 1;
+            }
         } else if (cmd == 'q') {
             int p = (param_count && param_values[0] >= 0) ? param_values[0] : 0;
             if (p >= 0 && p <= 7) {
@@ -1096,6 +1261,15 @@ void handle_ansi_sequence(const char *seq, int len, TerminalState *state,
             }
             if (csi_has_param(param_values, param_count, 1)) {
                 state->application_cursor_keys = 0;
+            }
+            if (csi_has_param(param_values, param_count, 5)) {
+                if (state->screen_reverse) {
+                    state->screen_reverse = 0;
+                    mark_all_rows_dirty();
+                }
+            }
+            if (csi_has_param(param_values, param_count, 1004)) {
+                state->focus_mode = 0;
             }
         }
         return;
@@ -1457,6 +1631,7 @@ void handle_ansi_sequence(const char *seq, int len, TerminalState *state,
             for (int c = from; c < from + shift && c < term_cols; c++) {
                 clear_cell(&terminal_buffer[state->row][c], state);
             }
+            mark_row_dirty(state->row);
         } break;
 
         case 'P': {
@@ -1476,6 +1651,7 @@ void handle_ansi_sequence(const char *seq, int len, TerminalState *state,
             for (int c = term_cols - shift; c < term_cols; c++) {
                 clear_cell(&terminal_buffer[state->row][c], state);
             }
+            mark_row_dirty(state->row);
         } break;
 
         case 'L': {
@@ -1498,6 +1674,7 @@ void handle_ansi_sequence(const char *seq, int len, TerminalState *state,
             for (int row = r; row < r + n && row <= bottom; row++) {
                 clear_row_range(row, 0, term_cols - 1, state);
             }
+            mark_rows_dirty(r, bottom);
         } break;
 
         case 'M': {
@@ -1520,6 +1697,7 @@ void handle_ansi_sequence(const char *seq, int len, TerminalState *state,
             for (int row = bottom - n + 1; row <= bottom; row++) {
                 clear_row_range(row, 0, term_cols - 1, state);
             }
+            mark_rows_dirty(r, bottom);
         } break;
 
         case 'X': {
@@ -1751,6 +1929,8 @@ void put_char(char c, TerminalState *state) {
             terminal_buffer[row][col].width = (uint8_t)width;
             terminal_buffer[row][col].is_continuation = 0;
 
+            mark_row_dirty(row);
+
             memcpy(state->lastc, state->utf8_buf, (size_t)state->utf8_len);
             state->lastc[state->utf8_len] = '\0';
 
@@ -1876,6 +2056,24 @@ void terminal_consume_bytes(const uint8_t *bytes, size_t len, TerminalState *sta
                 terminal_soft_reset(state);
                 i++;
                 continue;
+            }
+
+            /* ESC % G → switch to UTF-8 mode; ESC % @ → switch to legacy mode */
+            if (buf[i] == '%' && i + 1 < buflen) {
+                uint8_t x = buf[i + 1];
+                if (x == 'G') state->utf8_mode = 1;
+                else if (x == '@') state->utf8_mode = 0;
+                i += 2;
+                continue;
+            }
+            if (buf[i] == '%' && i + 1 >= buflen) {
+                /* Incomplete sequence; save pending */
+                size_t tail = buflen - start;
+                if (tail > 0 && tail <= CSI_PENDING_MAX) {
+                    memcpy(state->csi_pending, buf + start, tail);
+                    state->csi_pending_len = (int)tail;
+                }
+                break;
             }
 
             /* ESC ( X or ESC ) X - G0/G1 charset designation (DEC Special Graphics) */
