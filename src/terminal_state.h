@@ -20,6 +20,7 @@ extern int term_cols;
 #define ATTR_BLINK      (1 << 5)
 #define ATTR_INVISIBLE  (1 << 6)
 #define ATTR_STRUCK     (1 << 7)
+#define ATTR_WRAP       (1 << 8)  /* line was soft-wrapped here (st compat) */
 
 #define COLOR_DEFAULT_FG 258
 #define COLOR_DEFAULT_BG 259
@@ -107,6 +108,24 @@ typedef struct {
     int charset_g0;
     int charset_g1;
     int gl;  /* 0=G0 in GL, 1=G1 in GL (SO/SI) */
+
+    /* DECSET 1004: send \033[I/\033[O on focus in/out */
+    int focus_mode;
+
+    /* DECSCNM (DEC private mode 5): global reverse video */
+    int screen_reverse;
+
+    /* Dynamic default colors set via OSC 10/11/12 (0=use palette default) */
+    uint32_t osc_fg_color;  /* 0 = use default */
+    uint32_t osc_bg_color;  /* 0 = use default */
+    uint32_t osc_cs_color;  /* 0 = use default */
+
+    /* OSC 4 palette overrides (indexed 0..255); 0 = not overridden */
+    uint32_t palette_override[256];
+    uint8_t  palette_overridden[256];
+
+    /* UTF-8 mode: 1 = UTF-8 (default), 0 = legacy 8-bit */
+    int utf8_mode;
 } TerminalState;
 
 
@@ -115,6 +134,10 @@ extern TerminalState term_state;
 
 // Declare the terminal buffer with attributes
 extern TerminalCell **terminal_buffer;
+
+/* Per-row dirty flags: dirty_rows[r] = 1 means row r must be redrawn.
+   Allocated/resized alongside terminal_buffer in resize_terminal(). */
+extern uint8_t *dirty_rows;
 
 // Function prototypes
 void resize_terminal(int new_rows, int new_cols);

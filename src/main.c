@@ -21,7 +21,7 @@
 #include "pty_session.h"
 #include "terminal_state.h"
 
-#define BUF_SIZE 1024
+#define BUF_SIZE 65536
 #define VERSION "0.1"
 
 char *argv0;
@@ -146,30 +146,39 @@ static void pty_response_cb(const uint8_t *bytes, size_t len, void *ctx) {
 int handle_pty_output(Display *display, Window window, GC gc, PtySession *session, TerminalState *state) {
     (void)gc;
     char buf[BUF_SIZE];
-    ssize_t num_read = pty_session_read(session, buf, BUF_SIZE - 1);
+    int got_data = 0;
 
-    if (num_read == 0) {
-        return 0; // EOF or error (e.g. child exited)
-    }
-    if (num_read < 0) {
-        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
-            return 1;
+    /* Drain all available PTY data before returning so that a single btop
+     * redraw frame (10-30 KB) is fully parsed in one call rather than spread
+     * across several select() iterations.  The master fd is O_NONBLOCK so
+     * read() returns EAGAIN as soon as the kernel buffer is empty. */
+    for (;;) {
+        ssize_t num_read = pty_session_read(session, buf, BUF_SIZE - 1);
+        if (num_read > 0) {
+            got_data = 1;
+            terminal_consume_bytes((const uint8_t *)buf, (size_t)num_read,
+                                   state, pty_response_cb, session);
+            if (state->title_dirty) {
+                XStoreName(display, window,
+                           state->window_title[0] ? state->window_title
+                                                   : "cupidterminal");
+                state->title_dirty = 0;
+            }
+            if (state->osc52_pending) {
+                clipboard_set_data(display, window,
+                                   state->osc52_buf, state->osc52_len);
+                state->osc52_pending = 0;
+                state->osc52_len = 0;
+            }
+        } else if (num_read == 0) {
+            return 0; /* EOF / child exited */
+        } else {
+            if (errno == EINTR) continue;
+            break; /* EAGAIN / EWOULDBLOCK — kernel buffer empty */
         }
-        return 0;
-    }
-
-    terminal_consume_bytes((const uint8_t *)buf, (size_t)num_read, state, pty_response_cb, session);
-    if (state->title_dirty) {
-        XStoreName(display, window, state->window_title[0] ? state->window_title : "cupidterminal");
-        state->title_dirty = 0;
-    }
-    if (state->osc52_pending) {
-        clipboard_set_data(display, window, state->osc52_buf, state->osc52_len);
-        state->osc52_pending = 0;
-        state->osc52_len = 0;
     }
     /* draw deferred to main loop (latency batching) */
-    return 1;
+    return got_data ? 1 : 0;
 }
 
 int main(int argc, char *argv[]) {
@@ -265,19 +274,26 @@ run:
         XSetWMProtocols(display, window, &wm_delete, 1);
     }
     XSelectInput(display, window,
-        ExposureMask | KeyPressMask | PropertyChangeMask | StructureNotifyMask |
+        ExposureMask | KeyPressMask | KeyReleaseMask | PropertyChangeMask |
+        StructureNotifyMask | FocusChangeMask |
         ButtonPressMask | ButtonReleaseMask | PointerMotionMask);
     XMapWindow(display, window);
 
     gc = XCreateGC(display, window, 0, NULL);
 
-    // Start shell process in a pseudo-terminal
-    if (pty_session_spawn(&g_pty_session, SHELL, TERM) == -1) {
+    /* Start shell / serial-line process */
+    if (pty_session_spawn(&g_pty_session, opt_line, SHELL, opt_cmd, TERM) == -1) {
         XCloseDisplay(display);
         return EXIT_FAILURE;
     }
 
     initialize_xft(display, window);
+    {
+        XWindowAttributes wa_init;
+        if (XGetWindowAttributes(display, window, &wa_init)) {
+            draw_notify_resize(wa_init.width, wa_init.height);
+        }
+    }
     sync_pty_winsize_from_window(display, window, &g_pty_session);
     
     // Intern atoms once
@@ -362,6 +378,10 @@ run:
             had_input = 1;
             XNextEvent(display, &event);
 
+            /* XIM: let the input method filter events before we process them */
+            if (XFilterEvent(&event, None))
+                continue;
+
             if (event.type == KeyPress) {
                 handle_keypress(display, window, &event, g_pty_session.master_fd);
             } else if (event.type == Expose) {
@@ -369,6 +389,7 @@ run:
             } else if (event.type == SelectionNotify) {
                 handle_paste_event(display, window, &event, g_pty_session.master_fd);
             } else if (event.type == ConfigureNotify) {
+                draw_notify_resize(event.xconfigure.width, event.xconfigure.height);
                 sync_pty_winsize_from_window(display, window, &g_pty_session);
                 
             } else if (event.type == ButtonPress || event.type == ButtonRelease ||
@@ -424,6 +445,15 @@ run:
                     selection_release(display, window, c, r);
                 }
                 }
+            } else if (event.type == FocusIn) {
+                /* XIM: notify input context of focus */
+                xim_focus_in();
+                if (term_state.focus_mode && g_pty_session.master_fd >= 0)
+                    (void)pty_session_write(&g_pty_session, "\033[I", 3);
+            } else if (event.type == FocusOut) {
+                xim_focus_out();
+                if (term_state.focus_mode && g_pty_session.master_fd >= 0)
+                    (void)pty_session_write(&g_pty_session, "\033[O", 3);
             } else if (event.type == ClientMessage) {
                 Atom wm_protocols = XInternAtom(display, "WM_PROTOCOLS", False);
                 Atom wm_delete = XInternAtom(display, "WM_DELETE_WINDOW", False);
@@ -493,6 +523,8 @@ run:
         }
 
         draw_text(display, window, gc);
+        xximspot(display, window);
+        XFlush(display);
         drawing = 0;
     }
 
