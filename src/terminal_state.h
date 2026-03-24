@@ -56,6 +56,8 @@ typedef struct {
     int autowrap_mode;      /* DECAWM ?7 */
     int origin_mode;        /* DECOM ?6 */
     int insert_mode;        /* IRM 4 */
+    int wrap_next;          /* st-like pending wrap flag */
+    int wrap_overwrite_next; /* HT at margin: next printable overwrites last col, same row */
     int lnm_mode;          /* LNM 20: LF sends CR+LF */
     int echo_mode;         /* SRM 12: echo input to display */
 
@@ -126,6 +128,13 @@ typedef struct {
 
     /* UTF-8 mode: 1 = UTF-8 (default), 0 = legacy 8-bit */
     int utf8_mode;
+
+    /* Primary-screen scrollback offset (0 = live bottom) */
+    int scrollback_offset;
+
+    /* Non-OSC string collector state (DCS/APC/PM): ignored until ST */
+    int str_ignore_active;
+    int str_ignore_esc_pending;
 } TerminalState;
 
 
@@ -150,5 +159,11 @@ void handle_ansi_sequence(const char *seq, int len, TerminalState *state,
 void put_char(char c, TerminalState *state);
 size_t terminal_format_paste_payload(const uint8_t *input, size_t input_len, int bracketed_mode,
     uint8_t *output, size_t output_cap);
+void terminal_mark_all_rows_dirty(void);
+void terminal_scrollback_up(int n);
+void terminal_scrollback_down(int n);
+void terminal_scrollback_reset(void);
+int terminal_get_scrollback_offset(void);
+const TerminalCell *terminal_get_visible_row(int visual_row);
 
 #endif // TERMINAL_STATE_H

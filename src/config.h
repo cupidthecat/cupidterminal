@@ -60,8 +60,8 @@ typedef struct {
 /* Selection type for rectangular selection */
 #define SEL_RECTANGULAR 1
 
-/* Appearance */
-static char *font __attribute__((unused)) = "DejaVu Sans Mono, Noto Color Emoji:pixelsize=12:antialias=true";
+/* Appearance — full Fontconfig pattern (same style as st config.h "font") */
+static char *font __attribute__((unused)) = "undefined medium:pixelsize=12:antialias=true:autohint=true";
 extern char *opt_font;
 static int borderpx __attribute__((unused)) = 2;
 extern double usedfontsize;

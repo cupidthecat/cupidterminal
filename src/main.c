@@ -38,8 +38,9 @@ unsigned int tabspaces = 8;
 unsigned int defaultfg = 258;
 unsigned int defaultbg = 259;
 unsigned int defaultcs = 256;
-double usedfontsize = 12;
-double defaultfontsize = 12;
+/* Resolved from the font pattern on first Xft load (st-style). */
+double usedfontsize = 0;
+double defaultfontsize = 0;
 char **opt_cmd = NULL;
 char *opt_embed = NULL;
 char *opt_io = NULL;
@@ -429,6 +430,13 @@ run:
                     if (evt >= 0 && btn >= 1 && btn <= 12) {
                         send_mouse_report(g_pty_session.master_fd, evt, btn,
                             c + 1, r + 1, mods, term_state.mouse_sgr_mode);
+                    }
+                } else if (event.type == ButtonPress && !term_state.alt_screen_active &&
+                           (event.xbutton.button == Button4 || event.xbutton.button == Button5)) {
+                    if (event.xbutton.button == Button4) {
+                        terminal_scrollback_up(1);
+                    } else {
+                        terminal_scrollback_down(1);
                     }
                 } else if (event.type == ButtonPress && event.xbutton.button == Button1) {
                     int r, c;

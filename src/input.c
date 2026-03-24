@@ -123,6 +123,8 @@ static void tty_write_all_may_echo(int fd, const uint8_t *data, size_t len, int 
         return;
     }
 
+    terminal_scrollback_reset();
+
     if (may_echo && term_state.echo_mode) {
         terminal_consume_bytes(data, len, &term_state, NULL, NULL);
     }
@@ -259,6 +261,7 @@ void selection_start(int col, int row, unsigned int state) {
             term_state.sel_active = 1;
             term_state.sel_anchor_row = term_state.sel_row = row;
             term_state.sel_anchor_col = term_state.sel_col = col;
+            terminal_mark_all_rows_dirty();
             return;
         }
     }
@@ -276,12 +279,14 @@ void selection_start(int col, int row, unsigned int state) {
     term_state.sel_active = 1;
     term_state.sel_anchor_row = term_state.sel_row = row;
     term_state.sel_anchor_col = term_state.sel_col = col;
+    terminal_mark_all_rows_dirty();
 }
 
 void selection_extend(int col, int row) {
     if (term_state.sel_active) {
         term_state.sel_row = row;
         term_state.sel_col = col;
+        terminal_mark_all_rows_dirty();
     }
 }
 
@@ -292,6 +297,7 @@ void selection_release(Display *display, Window window, int col, int row) {
     term_state.sel_col = col;
     copy_to_clipboard(display, window);
     term_state.sel_active = 0;
+    terminal_mark_all_rows_dirty();
 }
 
 const unsigned char *clipboard_get_data(size_t *len_out) {
@@ -544,6 +550,17 @@ void handle_keypress(Display *display, Window window, XEvent *event, int pty_fd)
                 bp->func(&bp->arg);
             return;
         }
+    }
+
+    if (!term_state.alt_screen_active && (state & ShiftMask) && keysym == XK_Page_Up) {
+        int n = (term_rows > 1) ? (term_rows - 1) : 1;
+        terminal_scrollback_up(n);
+        return;
+    }
+    if (!term_state.alt_screen_active && (state & ShiftMask) && keysym == XK_Page_Down) {
+        int n = (term_rows > 1) ? (term_rows - 1) : 1;
+        terminal_scrollback_down(n);
+        return;
     }
 
     /* 2. Check key table (kmap) */

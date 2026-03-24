@@ -1,10 +1,13 @@
 // draw.c
+#define _POSIX_C_SOURCE 199309L
 #include <X11/Xlib.h>
 #include <X11/Xft/Xft.h>
 #include <utf8proc.h> // unicode
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
+#include <time.h>
 #include "draw.h"
 #include "config.h"
 #include "terminal_state.h"
@@ -198,6 +201,61 @@ typedef struct { uint32_t key; XftColor color; } TcEntry;
 static TcEntry tc_hash[TC_HASH_SIZE];
 static TcEntry tc_faint_hash[TC_HASH_SIZE];
 
+static int blink_hidden = 0;
+static int blink_initialized = 0;
+static struct timespec blink_last_toggle = {0, 0};
+
+static void mark_all_rows_dirty_local(void) {
+    if (!dirty_rows || term_rows <= 0) {
+        return;
+    }
+    memset(dirty_rows, 1, (size_t)term_rows);
+}
+
+static void update_blink_state(void) {
+    struct timespec now;
+    unsigned int interval = blinktimeout;
+
+    if (interval == 0) {
+        if (blink_hidden) {
+            blink_hidden = 0;
+            mark_all_rows_dirty_local();
+        }
+        blink_initialized = 0;
+        return;
+    }
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return;
+    }
+
+    if (!blink_initialized) {
+        blink_last_toggle = now;
+        blink_initialized = 1;
+        return;
+    }
+
+    {
+        long long elapsed_ms = (now.tv_sec - blink_last_toggle.tv_sec) * 1000LL +
+            (now.tv_nsec - blink_last_toggle.tv_nsec) / 1000000LL;
+        if (elapsed_ms >= (long long)interval) {
+            long long ticks = elapsed_ms / (long long)interval;
+            if (ticks % 2LL != 0LL) {
+                blink_hidden = !blink_hidden;
+            }
+
+            blink_last_toggle.tv_sec += (time_t)((ticks * interval) / 1000LL);
+            blink_last_toggle.tv_nsec += (long)(((ticks * interval) % 1000LL) * 1000000LL);
+            if (blink_last_toggle.tv_nsec >= 1000000000L) {
+                blink_last_toggle.tv_sec += 1;
+                blink_last_toggle.tv_nsec -= 1000000000L;
+            }
+
+            mark_all_rows_dirty_local();
+        }
+    }
+}
+
 /* Open-addressing hash table for glyph fallback font lookup.
  * occupied == 0 is the empty-slot sentinel (zero-initialized by static storage).
  * font == NULL with occupied == 1 means "tried, no font found" – the miss is
@@ -212,6 +270,45 @@ typedef struct {
     XftFont         *font;
 } GfEntry;
 static GfEntry gf_hash[GF_HASH_SIZE];
+
+/*
+ * st keeps Font.pattern = configured (pre-match query pattern) and uses
+ * FcFontSort + FcFontSetMatch for missing glyphs (st/x.c xmakeglyphfontspecs).
+ * XftFont->pattern alone is only the matched face; FcFontMatch(charset) on that
+ * cannot walk the same fallback list — causes tofu boxes.  g_fc_pat[] mirrors
+ * st's per-style patterns; g_fc_set[] is FcFontSort(...) lazily.
+ */
+static FcPattern *g_fc_pat[4];
+static FcFontSet *g_fc_set[4];
+
+static void fc_fallback_teardown(void) {
+    for (int i = 0; i < 4; i++) {
+        if (g_fc_set[i]) {
+            FcFontSetDestroy(g_fc_set[i]);
+            g_fc_set[i] = NULL;
+        }
+        if (g_fc_pat[i]) {
+            FcPatternDestroy(g_fc_pat[i]);
+            g_fc_pat[i] = NULL;
+        }
+    }
+}
+
+static FcPattern *pattern_for_glyph_fallback(uint8_t style) {
+    if (style < 4 && g_fc_pat[style])
+        return g_fc_pat[style];
+    if (style == 3) {
+        if (g_fc_pat[3]) return g_fc_pat[3];
+        if (g_fc_pat[1]) return g_fc_pat[1];
+        if (g_fc_pat[2]) return g_fc_pat[2];
+        return g_fc_pat[0];
+    }
+    if (style == 2 && !g_fc_pat[2])
+        return g_fc_pat[0];
+    if (style == 1 && !g_fc_pat[1])
+        return g_fc_pat[0];
+    return g_fc_pat[0];
+}
 
 static void clear_glyph_fallback_cache(Display *display) {
     for (int i = 0; i < GF_HASH_SIZE; i++) {
@@ -263,49 +360,66 @@ static void insert_glyph_fallback(utf8proc_int32_t cp, uint8_t style, XftFont *f
             return;
         }
     }
-    /* Table full: close the font to avoid a leak, silently skip caching. */
-    if (font && global_display) XftFontClose(global_display, font);
+    /*
+     * Table full: skip caching.
+     * Do not close FONT here because caller may still draw with it.
+     * (st uses a growable fallback cache; this fixed-size table must
+     * preserve correctness over aggressive reclamation.)
+     */
 }
 
-static XftFont *load_glyph_fallback(Display *display, XftFont *base_font, utf8proc_int32_t cp) {
-    FcPattern *pattern;
-    FcPattern *match;
-    FcCharSet *charset;
-    FcResult result;
+static XftFont *load_glyph_fallback(Display *display, uint8_t style, utf8proc_int32_t cp) {
+    FcPattern *base_pat;
+    FcPattern *fcpattern;
+    FcPattern *fontpattern;
+    FcCharSet *fccharset;
+    FcFontSet *fcsets[1];
+    FcResult fcres;
     XftFont *font = NULL;
 
-    if (!display || !base_font || !base_font->pattern || cp < 0) {
+    if (!display || cp < 0)
+        return NULL;
+
+    base_pat = pattern_for_glyph_fallback(style);
+    if (!base_pat)
+        return NULL;
+
+    if (!g_fc_set[style]) {
+        g_fc_set[style] = FcFontSort(NULL, base_pat, FcTrue, NULL, &fcres);
+        if (!g_fc_set[style] && base_pat != g_fc_pat[0] && g_fc_pat[0])
+            g_fc_set[style] = FcFontSort(NULL, g_fc_pat[0], FcTrue, NULL, &fcres);
+    }
+    if (!g_fc_set[style])
+        return NULL;
+
+    fcpattern = FcPatternDuplicate(base_pat);
+    if (!fcpattern)
+        return NULL;
+
+    fccharset = FcCharSetCreate();
+    if (!fccharset) {
+        FcPatternDestroy(fcpattern);
         return NULL;
     }
 
-    pattern = FcPatternDuplicate(base_font->pattern);
-    if (!pattern) {
+    FcCharSetAddChar(fccharset, (FcChar32)cp);
+    FcPatternAddCharSet(fcpattern, FC_CHARSET, fccharset);
+    FcPatternAddBool(fcpattern, FC_SCALABLE, FcTrue);
+    FcConfigSubstitute(NULL, fcpattern, FcMatchPattern);
+    FcDefaultSubstitute(fcpattern);
+
+    fcsets[0] = g_fc_set[style];
+    fontpattern = FcFontSetMatch(NULL, fcsets, 1, fcpattern, &fcres);
+
+    FcPatternDestroy(fcpattern);
+    FcCharSetDestroy(fccharset);
+
+    if (!fontpattern)
         return NULL;
-    }
 
-    charset = FcCharSetCreate();
-    if (!charset) {
-        FcPatternDestroy(pattern);
+    font = XftFontOpenPattern(display, fontpattern);
+    if (!font)
         return NULL;
-    }
-
-    FcCharSetAddChar(charset, (FcChar32)cp);
-    FcPatternAddCharSet(pattern, FC_CHARSET, charset);
-    FcPatternAddBool(pattern, FC_SCALABLE, FcTrue);
-    FcConfigSubstitute(NULL, pattern, FcMatchPattern);
-    FcDefaultSubstitute(pattern);
-
-    match = FcFontMatch(NULL, pattern, &result);
-    if (match) {
-        font = XftFontOpenPattern(display, match);
-    }
-
-    FcCharSetDestroy(charset);
-    FcPatternDestroy(pattern);
-
-    if (!font) {
-        return NULL;
-    }
 
     if (XftCharIndex(display, font, (FcChar32)cp) == 0) {
         XftFontClose(display, font);
@@ -325,6 +439,30 @@ static unsigned short
 sixd_to_16bit(int x)
 {
     return (unsigned short)(x == 0 ? 0 : (0x3737 + 0x2828 * x));
+}
+
+static int parse_config_color(uint32_t idx, XRenderColor *out)
+{
+    XColor xc;
+
+    if (!out || !global_display) {
+        return 0;
+    }
+    if ((size_t)idx >= LEN(colorname) || colorname[idx] == NULL || colorname[idx][0] == '\0') {
+        return 0;
+    }
+
+    if (!XParseColor(global_display,
+            DefaultColormap(global_display, DefaultScreen(global_display)),
+            colorname[idx], &xc)) {
+        return 0;
+    }
+
+    out->red = xc.red;
+    out->green = xc.green;
+    out->blue = xc.blue;
+    out->alpha = 0xFFFF;
+    return 1;
 }
 
 static XRenderColor get_xrender_color(uint32_t c, int is_bg, int is_faint) {
@@ -349,6 +487,8 @@ static XRenderColor get_xrender_color(uint32_t c, int is_bg, int is_faint) {
             (unsigned short)(b * 0x101),
             0xFFFF
         };
+    } else if (parse_config_color(c, &xc)) {
+        /* st-compatible: prefer explicit colorname[] entries when present. */
     } else if (c < 16) {
         static const unsigned char ansi[16][3] = {
             {0x00, 0x00, 0x00}, /* black */
@@ -395,8 +535,13 @@ static XRenderColor get_xrender_color(uint32_t c, int is_bg, int is_faint) {
     } else if (c == 259) {
         xc = (XRenderColor){0x0000, 0x0000, 0x0000, 0xFFFF}; /* default bg */
     } else {
-        xc = is_bg ? (XRenderColor){0x0000, 0x0000, 0x0000, 0xFFFF}
-                   : (XRenderColor){0xE5E5, 0xE5E5, 0xE5E5, 0xFFFF};
+        uint32_t fallback = is_bg ? defaultbg : defaultfg;
+        if (fallback != c && fallback <= COLOR_DEFAULT_BG) {
+            xc = get_xrender_color(fallback, is_bg, 0);
+        } else {
+            xc = is_bg ? (XRenderColor){0x0000, 0x0000, 0x0000, 0xFFFF}
+                       : (XRenderColor){0xE5E5, 0xE5E5, 0xE5E5, 0xFFFF};
+        }
     }
 
     if (is_faint && !is_bg) {
@@ -463,30 +608,179 @@ static XftColor *get_xft_color(Display *d, Window w, uint32_t logical_color, int
     }
 }
 
-/* Try to load font from pattern; returns font or NULL. Caller must not destroy pattern. */
-static XftFont *try_load_font(Display *display, const char *pattern_str) {
-    FcPattern *pattern = FcNameParse((const FcChar8 *)pattern_str);
-    if (!pattern) return NULL;
-    FcConfigSubstitute(NULL, pattern, FcMatchPattern);
-    FcDefaultSubstitute(pattern);
+/*
+ * Like st's xloadfont: keep the configured (pre-match) pattern for FcFontSort /
+ * FcFontSetMatch.  If out_configured_keep is NULL, the configured pattern is freed.
+ */
+static int open_xft_font(Display *display, FcPattern *pattern, XftFont **out_font,
+                         FcPattern **out_configured_keep) {
+    FcPattern *configured;
+    FcPattern *match;
     FcResult result;
-    XftFont *font = XftFontOpenPattern(display, FcFontMatch(NULL, pattern, &result));
-    FcPatternDestroy(pattern);
-    return font;
+
+    *out_font = NULL;
+    if (out_configured_keep)
+        *out_configured_keep = NULL;
+
+    configured = FcPatternDuplicate(pattern);
+    if (!configured)
+        return -1;
+
+    FcConfigSubstitute(NULL, configured, FcMatchPattern);
+    XftDefaultSubstitute(display, DefaultScreen(display), configured);
+
+    match = FcFontMatch(NULL, configured, &result);
+    if (!match) {
+        FcPatternDestroy(configured);
+        return -1;
+    }
+
+    *out_font = XftFontOpenPattern(display, match);
+    if (!*out_font) {
+        FcPatternDestroy(configured);
+        FcPatternDestroy(match);
+        return -1;
+    }
+
+    if (out_configured_keep)
+        *out_configured_keep = configured;
+    else
+        FcPatternDestroy(configured);
+    return 0;
 }
 
-/* Extract primary font family from FONT (before first comma), trim trailing spaces. */
-static void get_primary_font_family(char *out, size_t out_size) {
-    const char *comma = strchr(FONT, ',');
-    size_t len = comma ? (size_t)(comma - FONT) : strlen(FONT);
-    if (len >= out_size) len = out_size - 1;
-    if (len > 0) {
-        memcpy(out, FONT, len);
-        out[len] = '\0';
-        while (len > 0 && out[len - 1] == ' ') { out[--len] = '\0'; }
-    } else {
-        out[0] = '\0';
+/*
+ * Load primary + bold/italic/bold-italic + emoji from a full Fontconfig name string,
+ * mirroring st's xloadfonts / xloadfont (st/x.c). fontsize_override > 1 forces FC_PIXEL_SIZE.
+ * Returns 0 on success; on failure frees any opened fonts and returns -1.
+ */
+static int load_font_set(Display *display, const char *fontstr, double fontsize_override,
+                         XftFont **out_reg, XftFont **out_bold, XftFont **out_italic,
+                         XftFont **out_bold_italic, XftFont **out_emoji) {
+    FcPattern *pattern = NULL;
+    double fontval;
+    XftFont *nf = NULL, *nb = NULL, *ni = NULL, *nbi = NULL, *ne = NULL;
+    char emoji_buf[160];
+    FcPattern *epat;
+    FcResult eres;
+
+    *out_reg = *out_bold = *out_italic = *out_bold_italic = *out_emoji = NULL;
+
+    if (!fontstr || !fontstr[0])
+        fontstr = "monospace:pixelsize=12";
+
+    if (fontstr[0] == '-')
+        pattern = XftXlfdParse(fontstr, False, False);
+    else
+        pattern = FcNameParse((const FcChar8 *)fontstr);
+
+    if (!pattern) {
+        fprintf(stderr, "cupidterminal: can't parse font \"%s\"\n", fontstr);
+        return -1;
     }
+
+    {
+        FcPattern *pat_reg = NULL, *pat_bold = NULL, *pat_italic = NULL, *pat_bi = NULL;
+
+        if (fontsize_override > 1.0) {
+            FcPatternDel(pattern, FC_PIXEL_SIZE);
+            FcPatternDel(pattern, FC_SIZE);
+            FcPatternAddDouble(pattern, FC_PIXEL_SIZE, fontsize_override);
+            usedfontsize = fontsize_override;
+        } else {
+            if (FcPatternGetDouble(pattern, FC_PIXEL_SIZE, 0, &fontval) == FcResultMatch) {
+                usedfontsize = fontval;
+            } else if (FcPatternGetDouble(pattern, FC_SIZE, 0, &fontval) == FcResultMatch) {
+                usedfontsize = -1.0;
+            } else {
+                FcPatternAddDouble(pattern, FC_PIXEL_SIZE, 12.0);
+                usedfontsize = 12.0;
+            }
+            defaultfontsize = usedfontsize;
+        }
+
+        if (open_xft_font(display, pattern, &nf, &pat_reg) != 0) {
+            FcPatternDestroy(pattern);
+            return -1;
+        }
+
+        if (usedfontsize < 0.0) {
+            if (FcPatternGetDouble(nf->pattern, FC_PIXEL_SIZE, 0, &fontval) == FcResultMatch) {
+                usedfontsize = fontval;
+                if (fontsize_override <= 1.0)
+                    defaultfontsize = fontval;
+            }
+        }
+
+        /* Italic — same mutation order as st xloadfonts */
+        FcPatternDel(pattern, FC_SLANT);
+        FcPatternAddInteger(pattern, FC_SLANT, FC_SLANT_ITALIC);
+        if (open_xft_font(display, pattern, &ni, &pat_italic) != 0) {
+            ni = nf;
+            pat_italic = NULL;
+        }
+
+        FcPatternDel(pattern, FC_WEIGHT);
+        FcPatternAddInteger(pattern, FC_WEIGHT, FC_WEIGHT_BOLD);
+        if (open_xft_font(display, pattern, &nbi, &pat_bi) != 0) {
+            nbi = (ni != nf) ? ni : nf;
+            pat_bi = NULL;
+        }
+
+        FcPatternDel(pattern, FC_SLANT);
+        FcPatternAddInteger(pattern, FC_SLANT, FC_SLANT_ROMAN);
+        if (open_xft_font(display, pattern, &nb, &pat_bold) != 0) {
+            nb = nf;
+            pat_bold = NULL;
+        }
+
+        FcPatternDestroy(pattern);
+        pattern = NULL;
+
+        /* Only after new faces load: old patterns would break FcFontSetMatch if reload fails mid-way. */
+        fc_fallback_teardown();
+        g_fc_pat[0] = pat_reg;
+        g_fc_pat[1] = pat_bold;
+        g_fc_pat[2] = pat_italic;
+        g_fc_pat[3] = pat_bi;
+    }
+
+    {
+        int psz = (int)(usedfontsize > 0.0 ? usedfontsize + 0.5 : 12);
+        if (psz < 6) psz = 6;
+        if (psz > 256) psz = 256;
+        snprintf(emoji_buf, sizeof(emoji_buf), "Noto Color Emoji:pixelsize=%d", psz);
+        epat = FcNameParse((const FcChar8 *)emoji_buf);
+        if (epat) {
+            FcConfigSubstitute(NULL, epat, FcMatchPattern);
+            XftDefaultSubstitute(display, DefaultScreen(display), epat);
+            ne = XftFontOpenPattern(display, FcFontMatch(NULL, epat, &eres));
+            FcPatternDestroy(epat);
+        }
+        if (!ne)
+            ne = nf;
+    }
+
+    *out_reg = nf;
+    *out_bold = nb;
+    *out_italic = ni;
+    *out_bold_italic = nbi;
+    *out_emoji = ne;
+    return 0;
+}
+
+static void free_font_set(Display *display, XftFont *nf, XftFont *nb, XftFont *ni,
+                          XftFont *nbi, XftFont *ne) {
+    if (ne && ne != nf && ne != nb && ne != ni && ne != nbi)
+        XftFontClose(display, ne);
+    if (nbi && nbi != nf && nbi != nb && nbi != ni)
+        XftFontClose(display, nbi);
+    if (ni && ni != nf)
+        XftFontClose(display, ni);
+    if (nb && nb != nf)
+        XftFontClose(display, nb);
+    if (nf)
+        XftFontClose(display, nf);
 }
 
 static void recompute_cell_metrics(Display *display) {
@@ -516,14 +810,20 @@ static void recompute_cell_metrics(Display *display) {
 
     if (g_cell_w <= 0) g_cell_w = xft_font->max_advance_width;
     if (g_cell_w <= 0) g_cell_w = 8;
-    g_cell_h = xft_font->ascent + xft_font->descent;
+
+    {
+        int base_w = g_cell_w;
+        int base_h = xft_font->ascent + xft_font->descent;
+        int scaled_w = (int)(base_w * cwscale + 0.999f);
+        int scaled_h = (int)(base_h * chscale + 0.999f);
+        g_cell_w = (scaled_w > 0) ? scaled_w : 1;
+        g_cell_h = (scaled_h > 0) ? scaled_h : 1;
+    }
 }
 
 // Initialize Xft for Unicode and emoji support
 void initialize_xft(Display *display, Window window) {
-    char primary_family[128];
-    char pattern_buf[256];
-    FcResult result;
+    XftFont *nf, *nb, *ni, *nbi, *ne;
 
     global_display = display;
     global_window = window;
@@ -538,70 +838,23 @@ void initialize_xft(Display *display, Window window) {
         exit(EXIT_FAILURE);
     }
 
-    get_primary_font_family(primary_family, sizeof(primary_family));
-    snprintf(pattern_buf, sizeof(pattern_buf), "%s:size=%d", primary_family, FONT_SIZE);
-
-    xft_font = try_load_font(display, pattern_buf);
-    if (!xft_font) {
-        snprintf(pattern_buf, sizeof(pattern_buf), "DejaVu Sans Mono:size=%d", FONT_SIZE);
-        xft_font = try_load_font(display, pattern_buf);
-    }
-    if (!xft_font) {
-        snprintf(pattern_buf, sizeof(pattern_buf), "Liberation Mono:size=%d", FONT_SIZE);
-        xft_font = try_load_font(display, pattern_buf);
-    }
-    if (!xft_font) {
-        snprintf(pattern_buf, sizeof(pattern_buf), "monospace:size=%d", FONT_SIZE);
-        xft_font = try_load_font(display, pattern_buf);
-    }
-    if (!xft_font) {
-        fprintf(stderr, "Failed to load normal text font.\n");
-        exit(EXIT_FAILURE);
+    /* Full Fontconfig string + size from pattern (st xloadfonts with fontsize 0). */
+    if (load_font_set(display, FONT, 0.0, &nf, &nb, &ni, &nbi, &ne) != 0) {
+        fprintf(stderr, "cupidterminal: can't open font \"%s\", trying DejaVu Sans Mono\n", FONT);
+        if (load_font_set(display, "DejaVu Sans Mono:pixelsize=12:antialias=true", 12.0,
+                          &nf, &nb, &ni, &nbi, &ne) != 0) {
+            fprintf(stderr, "cupidterminal: failed to load fallback font.\n");
+            exit(EXIT_FAILURE);
+        }
+        /* Forced pixel size path does not set defaultfontsize — needed for zoom reset. */
+        defaultfontsize = usedfontsize;
     }
 
-    // Load emoji font
-    snprintf(pattern_buf, sizeof(pattern_buf), "Noto Color Emoji:size=%d", FONT_SIZE);
-    FcPattern *pattern = FcNameParse((const FcChar8 *)pattern_buf);
-    FcConfigSubstitute(NULL, pattern, FcMatchPattern);
-    FcDefaultSubstitute(pattern);
-    xft_font_emoji = XftFontOpenPattern(display, FcFontMatch(NULL, pattern, &result));
-    FcPatternDestroy(pattern);
-
-    if (!xft_font_emoji) {
-        fprintf(stderr, "Failed to load emoji font, falling back to normal font.\n");
-        xft_font_emoji = xft_font;
-    }
-
-    // Load bold font
-    snprintf(pattern_buf, sizeof(pattern_buf), "%s:bold:size=%d", primary_family, FONT_SIZE);
-    xft_font_bold = try_load_font(display, pattern_buf);
-    if (!xft_font_bold) {
-        snprintf(pattern_buf, sizeof(pattern_buf), "DejaVu Sans Mono:bold:size=%d", FONT_SIZE);
-        xft_font_bold = try_load_font(display, pattern_buf);
-    }
-    if (!xft_font_bold) {
-        snprintf(pattern_buf, sizeof(pattern_buf), "monospace:bold:size=%d", FONT_SIZE);
-        xft_font_bold = try_load_font(display, pattern_buf);
-    }
-    if (!xft_font_bold) xft_font_bold = xft_font;
-
-    // Load italic font
-    snprintf(pattern_buf, sizeof(pattern_buf), "%s:italic:size=%d", primary_family, FONT_SIZE);
-    xft_font_italic = try_load_font(display, pattern_buf);
-    if (!xft_font_italic) {
-        snprintf(pattern_buf, sizeof(pattern_buf), "monospace:italic:size=%d", FONT_SIZE);
-        xft_font_italic = try_load_font(display, pattern_buf);
-    }
-    if (!xft_font_italic) xft_font_italic = xft_font;
-
-    // Load bold italic font
-    snprintf(pattern_buf, sizeof(pattern_buf), "%s:bold:italic:size=%d", primary_family, FONT_SIZE);
-    xft_font_bold_italic = try_load_font(display, pattern_buf);
-    if (!xft_font_bold_italic) {
-        snprintf(pattern_buf, sizeof(pattern_buf), "monospace:bold:italic:size=%d", FONT_SIZE);
-        xft_font_bold_italic = try_load_font(display, pattern_buf);
-    }
-    if (!xft_font_bold_italic) xft_font_bold_italic = xft_font_bold;
+    xft_font = nf;
+    xft_font_bold = nb;
+    xft_font_italic = ni;
+    xft_font_bold_italic = nbi;
+    xft_font_emoji = ne;
 
     // Allocate default foreground/background with st-compatible indices.
     XRenderColor rc_white = get_xrender_color(COLOR_DEFAULT_FG, 0, 0);
@@ -651,61 +904,27 @@ void initialize_xft(Display *display, Window window) {
 }
 
 static void xft_reload_fonts(Display *display) {
-    char primary_family[128];
-    char pattern_buf[256];
-    FcResult result;
-    XftFont *new_font, *new_bold, *new_italic, *new_bold_italic, *new_emoji;
-    int size = (int)(usedfontsize > 0 ? usedfontsize : 12);
-    if (size < 6) size = 6;
-    if (size > 256) size = 256;
+    double sz = usedfontsize;
+    XftFont *nf, *nb, *ni, *nbi, *ne;
+    XftFont *of = xft_font, *ob = xft_font_bold, *oi = xft_font_italic,
+            *obi = xft_font_bold_italic, *oe = xft_font_emoji;
 
-    get_primary_font_family(primary_family, sizeof(primary_family));
-    snprintf(pattern_buf, sizeof(pattern_buf), "%s:size=%d", primary_family, size);
-    new_font = try_load_font(display, pattern_buf);
-    if (!new_font) {
-        snprintf(pattern_buf, sizeof(pattern_buf), "DejaVu Sans Mono:size=%d", size);
-        new_font = try_load_font(display, pattern_buf);
-    }
-    if (!new_font) {
-        snprintf(pattern_buf, sizeof(pattern_buf), "monospace:size=%d", size);
-        new_font = try_load_font(display, pattern_buf);
-    }
-    if (!new_font) return;
-
-    snprintf(pattern_buf, sizeof(pattern_buf), "%s:bold:size=%d", primary_family, size);
-    new_bold = try_load_font(display, pattern_buf);
-    if (!new_bold) new_bold = new_font;
-
-    snprintf(pattern_buf, sizeof(pattern_buf), "%s:italic:size=%d", primary_family, size);
-    new_italic = try_load_font(display, pattern_buf);
-    if (!new_italic) new_italic = new_font;
-
-    snprintf(pattern_buf, sizeof(pattern_buf), "%s:bold:italic:size=%d", primary_family, size);
-    new_bold_italic = try_load_font(display, pattern_buf);
-    if (!new_bold_italic) new_bold_italic = new_bold;
-
-    snprintf(pattern_buf, sizeof(pattern_buf), "Noto Color Emoji:size=%d", size);
-    FcPattern *pattern = FcNameParse((const FcChar8 *)pattern_buf);
-    FcConfigSubstitute(NULL, pattern, FcMatchPattern);
-    FcDefaultSubstitute(pattern);
-    new_emoji = XftFontOpenPattern(display, FcFontMatch(NULL, pattern, &result));
-    FcPatternDestroy(pattern);
-    if (!new_emoji) new_emoji = new_font;
+    if (sz < 6.0) sz = 6.0;
+    if (sz > 256.0) sz = 256.0;
 
     clear_glyph_fallback_cache(display);
 
-    if (xft_font) XftFontClose(display, xft_font);
-    if (xft_font_bold && xft_font_bold != xft_font) XftFontClose(display, xft_font_bold);
-    if (xft_font_italic && xft_font_italic != xft_font) XftFontClose(display, xft_font_italic);
-    if (xft_font_bold_italic && xft_font_bold_italic != xft_font_bold && xft_font_bold_italic != xft_font_italic)
-        XftFontClose(display, xft_font_bold_italic);
-    if (xft_font_emoji && xft_font_emoji != xft_font) XftFontClose(display, xft_font_emoji);
+    /* st xloadfonts: fontsize > 1 forces FC_PIXEL_SIZE */
+    if (load_font_set(display, FONT, sz, &nf, &nb, &ni, &nbi, &ne) != 0)
+        return;
 
-    xft_font = new_font;
-    xft_font_bold = new_bold;
-    xft_font_italic = new_italic;
-    xft_font_bold_italic = new_bold_italic;
-    xft_font_emoji = new_emoji;
+    xft_font = nf;
+    xft_font_bold = nb;
+    xft_font_italic = ni;
+    xft_font_bold_italic = nbi;
+    xft_font_emoji = ne;
+
+    free_font_set(display, of, ob, oi, obi, oe);
 
     recompute_cell_metrics(display);
 }
@@ -730,6 +949,7 @@ void cleanup_xft(void) {
     if (g_xic) { XDestroyIC(g_xic); g_xic = NULL; }
     if (g_xim) { XCloseIM(g_xim);   g_xim = NULL; }
     clear_glyph_fallback_cache(global_display);
+    fc_fallback_teardown();
     if (xft_draw_buf) { XftDrawDestroy(xft_draw_buf); xft_draw_buf = NULL; }
     if (back_pixmap != None && global_display) {
         XFreePixmap(global_display, back_pixmap);
@@ -792,12 +1012,9 @@ static XftFont *font_for_cell(uint16_t attrs, utf8proc_int32_t cp) {
             }
         }
 
-        /* Not cached yet: do the expensive FcFontMatch lookup. */
+        /* Not cached yet: FcFontSetMatch like st (not FcFontMatch on the matched face only). */
         {
-            XftFont *fallback = load_glyph_fallback(global_display,
-                                    font_to_use ? font_to_use : xft_font, cp);
-            if (!fallback && font_to_use != xft_font)
-                fallback = load_glyph_fallback(global_display, xft_font, cp);
+            XftFont *fallback = load_glyph_fallback(global_display, style, cp);
             insert_glyph_fallback(cp, style, fallback); /* caches both hits and misses */
             if (fallback) return fallback;
         }
@@ -807,6 +1024,7 @@ static XftFont *font_for_cell(uint16_t attrs, utf8proc_int32_t cp) {
 }
 
 static void resolve_cell_colors(uint32_t in_fg, uint32_t in_bg, uint16_t attrs, int selected,
+                                int hide_blink,
                                 uint32_t *out_fg, uint32_t *out_bg) {
     uint32_t fg = in_fg;
     uint32_t bg = in_bg;
@@ -816,11 +1034,29 @@ static void resolve_cell_colors(uint32_t in_fg, uint32_t in_bg, uint16_t attrs, 
         fg += 8;
     }
 
-    /* DECSCNM: global screen reverse */
+    /* DECSCNM: mirror st behavior.
+       - swap defaults
+       - invert resolved RGB value for all non-default colors */
     if (term_state.screen_reverse) {
-        uint32_t tmp = fg;
-        fg = bg;
-        bg = tmp;
+        if (fg == COLOR_DEFAULT_FG) {
+            fg = COLOR_DEFAULT_BG;
+        } else {
+            XRenderColor rc = get_xrender_color(fg, 0, 0);
+            uint32_t rgb = ((uint32_t)(rc.red >> 8) << 16) |
+                           ((uint32_t)(rc.green >> 8) << 8) |
+                           (uint32_t)(rc.blue >> 8);
+            fg = COLOR_TRUE_RGB_BASE | ((~rgb) & 0x00FFFFFFu);
+        }
+
+        if (bg == COLOR_DEFAULT_BG) {
+            bg = COLOR_DEFAULT_FG;
+        } else {
+            XRenderColor rc = get_xrender_color(bg, 1, 0);
+            uint32_t rgb = ((uint32_t)(rc.red >> 8) << 16) |
+                           ((uint32_t)(rc.green >> 8) << 8) |
+                           (uint32_t)(rc.blue >> 8);
+            bg = COLOR_TRUE_RGB_BASE | ((~rgb) & 0x00FFFFFFu);
+        }
     }
 
     if (attrs & ATTR_REVERSE) {
@@ -833,7 +1069,7 @@ static void resolve_cell_colors(uint32_t in_fg, uint32_t in_bg, uint16_t attrs, 
         fg = bg;
         bg = tmp;
     }
-    if (attrs & ATTR_BLINK) {
+    if ((attrs & ATTR_BLINK) && hide_blink) {
         fg = bg;
     }
     if (attrs & ATTR_INVISIBLE) {
@@ -852,6 +1088,8 @@ static int prev_cursor_row = -1;
 // Draw text using TerminalState's current attr per character
 void draw_text(Display *display, Window window, GC gc) {
     if (!xft_draw) return;
+
+    update_blink_state();
 
     if (term_state.bell_rung) {
         XBell(display, 0);
@@ -898,6 +1136,8 @@ void draw_text(Display *display, Window window, GC gc) {
     const int step_w = g_cell_w + g_cell_gap;
     const int buf_w = back_w > 0 ? back_w : win_w;
     const int buf_h = back_h > 0 ? back_h : win_h;
+    const int scrollback_offset = terminal_get_scrollback_offset();
+    const int show_cursor = (scrollback_offset == 0);
 
     /* Dirty the rows occupied by the cursor (old position + new position) so
        the cursor shape is always erased/redrawn even when cell content is unchanged. */
@@ -907,7 +1147,8 @@ void draw_text(Display *display, Window window, GC gc) {
     if (dirty_rows) {
         if (prev_cursor_row >= 0 && prev_cursor_row < term_rows)
             dirty_rows[prev_cursor_row] = 1;
-        dirty_rows[cursor_row] = 1;
+        if (show_cursor)
+            dirty_rows[cursor_row] = 1;
     }
 
     /* Check whether anything actually needs rendering. */
@@ -933,9 +1174,15 @@ void draw_text(Display *display, Window window, GC gc) {
     }
 
     for (int r = 0; r < term_rows; r++) {
+        const TerminalCell *row_cells = terminal_get_visible_row(r);
+
         /* Skip rows that haven't changed (incremental update only). */
         if (!full && dirty_rows && !dirty_rows[r])
             continue;
+
+        if (!row_cells) {
+            continue;
+        }
 
         int x = LEFT_PAD;
         int y = baseline0 + r * (g_cell_h + line_gap);
@@ -962,7 +1209,7 @@ void draw_text(Display *display, Window window, GC gc) {
                 int cell_w_px = step_w;
 
                 if (c < term_cols) {
-                    const TerminalCell *cell = &terminal_buffer[r][c];
+                    const TerminalCell *cell = &row_cells[c];
                     if (cell->is_continuation) {
                         cur_px += step_w;
                         continue;
@@ -970,7 +1217,7 @@ void draw_text(Display *display, Window window, GC gc) {
                     int cell_span = (cell->width == 2 && c + 1 < term_cols) ? 2 : 1;
                     int selected = cell_selected(r, c) || (cell_span == 2 && cell_selected(r, c + 1));
                     uint32_t fg_val, bg_val;
-                    resolve_cell_colors(cell->fg, cell->bg, cell->attrs, selected, &fg_val, &bg_val);
+                    resolve_cell_colors(cell->fg, cell->bg, cell->attrs, selected, blink_hidden, &fg_val, &bg_val);
                     bg_color = get_xft_color(display, window, bg_val, 1, 0);
                     cell_w_px = g_cell_w * cell_span + g_cell_gap * (cell_span - 1);
                 }
@@ -1004,25 +1251,9 @@ void draw_text(Display *display, Window window, GC gc) {
          * are cheap (single pixel rect) and rarely span many cells.
          */
         {
-            /* Text run accumulator. MAX_CHARS (4096) is larger than any terminal row. */
-            char run_buf[MAX_CHARS];
-            int run_buf_len = 0;
-            int run_x = LEFT_PAD;       /* pixel x where the current run starts */
-            XftFont *run_font = NULL;
-            XftColor *run_fg_color = NULL;
-
-            /* Flush helper: draw accumulated run buffer, then reset. */
-#define FLUSH_TEXT_RUN() do { \
-    if (run_buf_len > 0 && run_font && run_fg_color) { \
-        XftDrawStringUtf8(draw, run_fg_color, run_font, run_x, y, \
-                          (const FcChar8 *)run_buf, run_buf_len); \
-        run_buf_len = 0; \
-    } \
-} while (0)
-
             x = LEFT_PAD;
             for (int c = 0; c < term_cols; c++) {
-                const TerminalCell *cell = &terminal_buffer[r][c];
+                const TerminalCell *cell = &row_cells[c];
                 int cell_span = 1;
                 int top = row_top;
                 int selected;
@@ -1040,56 +1271,31 @@ void draw_text(Display *display, Window window, GC gc) {
                     cell_span = 2;
 
                 selected = cell_selected(r, c) || (cell_span == 2 && cell_selected(r, c + 1));
-                resolve_cell_colors(cell->fg, cell->bg, cell->attrs, selected, &fg_val, &bg_val);
-                draw_w = g_cell_w * cell_span + g_cell_gap * (cell_span - 1);
+                resolve_cell_colors(cell->fg, cell->bg, cell->attrs, selected, blink_hidden, &fg_val, &bg_val);
+                draw_w = g_cell_w * cell_span;
                 fg_color = get_xft_color(display, window, fg_val, 0, (cell->attrs & ATTR_FAINT) != 0);
 
                 if (cell->c[0] != '\0') {
                     utf8proc_int32_t cp;
                     ssize_t rs = utf8proc_iterate((const uint8_t *)cell->c, -1, &cp);
                     if (rs > 0) {
+                        XRectangle clip_rect;
                         XftFont *font_to_use = font_for_cell(cell->attrs, cp);
                         int glyph_len = (int)strlen(cell->c);
+                        /* Draw one cell at a time to preserve terminal cell boundaries
+                           and avoid cross-cell ligature/shaping effects. */
 
-                        /* Wide chars break runs: draw at exact grid position to
-                           avoid advance-width mismatches with g_cell_w. */
-                        if (cell->width == 2) {
-                            FLUSH_TEXT_RUN();
-                            XftDrawStringUtf8(draw, fg_color, font_to_use, x, y,
-                                              (const FcChar8 *)cell->c, glyph_len);
-                            run_font = NULL;
-                            run_fg_color = NULL;
-                        } else {
-                            /* Start a new run if font or color changes. */
-                            if (font_to_use != run_font || fg_color != run_fg_color) {
-                                FLUSH_TEXT_RUN();
-                                run_font = font_to_use;
-                                run_fg_color = fg_color;
-                                run_x = x;
-                            } else if (run_buf_len == 0) {
-                                run_x = x;
-                            }
+                        clip_rect.x = 0;
+                        clip_rect.y = 0;
+                        clip_rect.width = (unsigned short)draw_w;
+                        clip_rect.height = (unsigned short)g_cell_h;
+                        XftDrawSetClipRectangles(draw, x, top, &clip_rect, 1);
 
-                            /* Append cell's UTF-8 bytes to the run buffer. */
-                            if (run_buf_len + glyph_len < (int)sizeof(run_buf)) {
-                                memcpy(run_buf + run_buf_len, cell->c, (size_t)glyph_len);
-                                run_buf_len += glyph_len;
-                            } else {
-                                /* Buffer full: flush then start fresh. */
-                                FLUSH_TEXT_RUN();
-                                run_font = font_to_use;
-                                run_fg_color = fg_color;
-                                run_x = x;
-                                memcpy(run_buf, cell->c, (size_t)glyph_len);
-                                run_buf_len = glyph_len;
-                            }
-                        }
+                        XftDrawStringUtf8(draw, fg_color, font_to_use, x, y,
+                                          (const FcChar8 *)cell->c, glyph_len);
+
+                        XftDrawSetClip(draw, NULL);
                     }
-                } else {
-                    /* Empty cell breaks any active text run. */
-                    FLUSH_TEXT_RUN();
-                    run_font = NULL;
-                    run_fg_color = NULL;
                 }
 
                 /* Decorations are cheap; draw per-cell. */
@@ -1100,14 +1306,11 @@ void draw_text(Display *display, Window window, GC gc) {
 
                 x += step_w;
             }
-            /* Flush any remaining run at end of row. */
-            FLUSH_TEXT_RUN();
-#undef FLUSH_TEXT_RUN
         }
     }
 
     /* Cursor: shape from DECSCUSR (0-2 block, 3-4 underline, 5-6 bar, 7 snowman) */
-    if (term_state.cursor_visible) {
+    if (term_state.cursor_visible && show_cursor) {
         int cur_row = term_state.row;
         int cur_col = term_state.col;
         int cur_span = 1;
@@ -1115,6 +1318,7 @@ void draw_text(Display *display, Window window, GC gc) {
         uint32_t cursor_fg_idx;
         uint32_t cursor_bg_idx;
         const TerminalCell *cursor_cell;
+        uint16_t cursor_attrs;
         int cur_x;
         int cur_w;
         int cur_h = g_cell_h;
@@ -1132,16 +1336,27 @@ void draw_text(Display *display, Window window, GC gc) {
         }
 
         cursor_cell = &terminal_buffer[cur_row][cur_col];
+        cursor_attrs = cursor_cell->attrs & (ATTR_BOLD | ATTR_ITALIC | ATTR_UNDERLINE | ATTR_STRUCK);
         if (cursor_cell->width == 2 && cur_col + 1 < term_cols) {
             cur_span = 2;
         }
         selected = cell_selected(cur_row, cur_col) || (cur_span == 2 && cell_selected(cur_row, cur_col + 1));
 
-        cursor_fg_idx = selected ? COLOR_DEFAULT_FG : COLOR_DEFAULT_BG;
-        cursor_bg_idx = selected ? defaultrcs : defaultcs;
+        if (term_state.screen_reverse) {
+            cursor_bg_idx = selected ? defaultcs : defaultrcs;
+            cursor_fg_idx = selected ? defaultrcs : defaultcs;
+        } else {
+            if (selected) {
+                cursor_fg_idx = COLOR_DEFAULT_FG;
+                cursor_bg_idx = defaultrcs;
+            } else {
+                cursor_fg_idx = COLOR_DEFAULT_BG;
+                cursor_bg_idx = defaultcs;
+            }
+        }
 
         cur_x = left_pad + cur_col * step_w;
-        cur_w = g_cell_w * cur_span + g_cell_gap * (cur_span - 1);
+        cur_w = g_cell_w * cur_span;
         cy_top = baseline0 + cur_row * (g_cell_h + line_gap) - xft_font->ascent;
         cursor_bg_color = get_xft_color(display, window, cursor_bg_idx, 1, 0);
 
@@ -1159,18 +1374,35 @@ void draw_text(Display *display, Window window, GC gc) {
 
             if (shape == 7) {
                 const char snowman[] = "\xE2\x98\x83";
-                XftDrawStringUtf8(draw, cursor_fg_color, xft_font,
+                XftFont *cursor_font = font_for_cell(cursor_attrs, 0x2603);
+                XRectangle clip_rect;
+
+                clip_rect.x = 0;
+                clip_rect.y = 0;
+                clip_rect.width = (unsigned short)cur_w;
+                clip_rect.height = (unsigned short)g_cell_h;
+                XftDrawSetClipRectangles(draw, cur_x, cy_top, &clip_rect, 1);
+                XftDrawStringUtf8(draw, cursor_fg_color, cursor_font,
                                   cur_x, baseline0 + cur_row * (g_cell_h + line_gap),
                                   (const FcChar8 *)snowman, 3);
+                XftDrawSetClip(draw, NULL);
             } else if (cursor_cell->c[0] != '\0') {
                 utf8proc_int32_t cp;
                 ssize_t rs = utf8proc_iterate((const uint8_t *)cursor_cell->c, -1, &cp);
                 if (rs > 0) {
-                    XftFont *font_to_use = font_for_cell(cursor_cell->attrs, cp);
+                    XftFont *font_to_use = font_for_cell(cursor_attrs, cp);
+                    XRectangle clip_rect;
+
+                    clip_rect.x = 0;
+                    clip_rect.y = 0;
+                    clip_rect.width = (unsigned short)cur_w;
+                    clip_rect.height = (unsigned short)g_cell_h;
+                    XftDrawSetClipRectangles(draw, cur_x, cy_top, &clip_rect, 1);
                     XftDrawStringUtf8(draw, cursor_fg_color, font_to_use,
                                       cur_x, baseline0 + cur_row * (g_cell_h + line_gap),
                                       (const FcChar8 *)cursor_cell->c,
                                       (int)strlen(cursor_cell->c));
+                    XftDrawSetClip(draw, NULL);
                 }
             }
         }
@@ -1182,7 +1414,7 @@ void draw_text(Display *display, Window window, GC gc) {
     }
 
     /* Update cursor tracking and clear dirty flags for next frame. */
-    prev_cursor_row = cursor_row;
+    prev_cursor_row = show_cursor ? cursor_row : -1;
     if (dirty_rows)
         memset(dirty_rows, 0, (size_t)term_rows);
 }

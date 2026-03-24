@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <limits.h>
 #include <sys/types.h>
 #include <wchar.h>
 
@@ -34,6 +35,11 @@ uint8_t *dirty_rows = NULL;
 static TerminalCell **primary_buffer = NULL;
 static TerminalCell **alternate_buffer = NULL;
 static unsigned char *tab_stops = NULL;
+
+#define HISTORY_SIZE 2000
+static TerminalCell **history_buffer = NULL;
+static int history_head = 0;   /* next insertion slot */
+static int history_count = 0;  /* number of valid rows in history */
 
 static void init_default_tab_stops(unsigned char *tabs, int cols) {
     unsigned int ts = (tabspaces > 0) ? tabspaces : 8;
@@ -114,6 +120,29 @@ static TerminalCell **alloc_buffer(int rows, int cols) {
     return buffer;
 }
 
+static TerminalCell **alloc_history_buffer(int cols) {
+    TerminalCell **buffer = calloc((size_t)HISTORY_SIZE, sizeof(TerminalCell *));
+    if (!buffer) {
+        return NULL;
+    }
+
+    for (int r = 0; r < HISTORY_SIZE; r++) {
+        buffer[r] = calloc((size_t)cols, sizeof(TerminalCell));
+        if (!buffer[r]) {
+            for (int rr = 0; rr < r; rr++) {
+                free(buffer[rr]);
+            }
+            free(buffer);
+            return NULL;
+        }
+        for (int c = 0; c < cols; c++) {
+            init_default_cell(&buffer[r][c]);
+        }
+    }
+
+    return buffer;
+}
+
 static void free_buffer(TerminalCell **buffer, int rows) {
     if (!buffer) {
         return;
@@ -123,6 +152,78 @@ static void free_buffer(TerminalCell **buffer, int rows) {
         free(buffer[r]);
     }
     free(buffer);
+}
+
+static void free_history_buffer(TerminalCell **buffer) {
+    if (!buffer) {
+        return;
+    }
+    for (int r = 0; r < HISTORY_SIZE; r++) {
+        free(buffer[r]);
+    }
+    free(buffer);
+}
+
+static TerminalCell **resize_history_buffer(TerminalCell **old_buffer, int old_cols, int new_cols) {
+    TerminalCell **new_buffer = alloc_history_buffer(new_cols);
+
+    if (!new_buffer) {
+        return NULL;
+    }
+
+    if (old_buffer && old_cols > 0) {
+        int copy_cols = (old_cols < new_cols) ? old_cols : new_cols;
+        if (copy_cols > 0) {
+            for (int r = 0; r < HISTORY_SIZE; r++) {
+                memcpy(new_buffer[r], old_buffer[r], (size_t)copy_cols * sizeof(TerminalCell));
+            }
+        }
+        free_history_buffer(old_buffer);
+    }
+
+    return new_buffer;
+}
+
+static void __attribute__((unused)) clear_history_row(int slot) {
+    if (!history_buffer || slot < 0 || slot >= HISTORY_SIZE || term_cols <= 0) {
+        return;
+    }
+    for (int c = 0; c < term_cols; c++) {
+        init_default_cell(&history_buffer[slot][c]);
+    }
+}
+
+static void push_history_line(const TerminalCell *row, TerminalState *state) {
+    if (!history_buffer || !row || !state || state->alt_screen_active || term_cols <= 0) {
+        return;
+    }
+
+    memcpy(history_buffer[history_head], row, (size_t)term_cols * sizeof(TerminalCell));
+    history_head = (history_head + 1) % HISTORY_SIZE;
+    if (history_count < HISTORY_SIZE) {
+        history_count++;
+    }
+
+    if (state->scrollback_offset > 0) {
+        if (state->scrollback_offset < history_count) {
+            state->scrollback_offset++;
+        } else {
+            state->scrollback_offset = history_count;
+        }
+    }
+}
+
+static const TerminalCell *history_row_by_relative_index(int rel) {
+    int oldest;
+    int slot;
+
+    if (!history_buffer || rel < 0 || rel >= history_count) {
+        return NULL;
+    }
+
+    oldest = (history_head - history_count + HISTORY_SIZE) % HISTORY_SIZE;
+    slot = (oldest + rel) % HISTORY_SIZE;
+    return history_buffer[slot];
 }
 
 static TerminalCell **resize_buffer(TerminalCell **old_buffer, int old_rows, int old_cols, int new_rows, int new_cols) {
@@ -220,9 +321,12 @@ static void cursor_home(TerminalState *state) {
     if (!state) {
         return;
     }
+    state->wrap_next = 0;
     state->row = cursor_min_row(state);
     state->col = 0;
 }
+
+static void cancel_pending_wrap(TerminalState *state);
 
 static void mark_row_dirty(int row) {
     if (dirty_rows && row >= 0 && row < term_rows)
@@ -240,6 +344,75 @@ static void mark_rows_dirty(int top, int bottom) {
 static void mark_all_rows_dirty(void) {
     if (dirty_rows)
         memset(dirty_rows, 1, (size_t)term_rows);
+}
+
+void terminal_mark_all_rows_dirty(void) {
+    mark_all_rows_dirty();
+}
+
+void terminal_scrollback_up(int n) {
+    if (n <= 0 || term_state.alt_screen_active) {
+        return;
+    }
+    if (history_count <= 0) {
+        return;
+    }
+    term_state.scrollback_offset += n;
+    if (term_state.scrollback_offset > history_count) {
+        term_state.scrollback_offset = history_count;
+    }
+    mark_all_rows_dirty();
+}
+
+void terminal_scrollback_down(int n) {
+    if (n <= 0 || term_state.alt_screen_active) {
+        return;
+    }
+    term_state.scrollback_offset -= n;
+    if (term_state.scrollback_offset < 0) {
+        term_state.scrollback_offset = 0;
+    }
+    mark_all_rows_dirty();
+}
+
+void terminal_scrollback_reset(void) {
+    if (term_state.scrollback_offset != 0) {
+        term_state.scrollback_offset = 0;
+        mark_all_rows_dirty();
+    }
+}
+
+int terminal_get_scrollback_offset(void) {
+    return term_state.scrollback_offset;
+}
+
+const TerminalCell *terminal_get_visible_row(int visual_row) {
+    int offset = term_state.scrollback_offset;
+    int live_row;
+    int rel;
+
+    if (visual_row < 0 || visual_row >= term_rows || term_cols <= 0 || !terminal_buffer) {
+        return NULL;
+    }
+
+    if (term_state.alt_screen_active || offset <= 0) {
+        return terminal_buffer[visual_row];
+    }
+
+    if (offset > history_count) {
+        offset = history_count;
+    }
+
+    if (visual_row < offset) {
+        rel = history_count - offset + visual_row;
+        return history_row_by_relative_index(rel);
+    }
+
+    live_row = visual_row - offset;
+    if (live_row < 0 || live_row >= term_rows) {
+        return NULL;
+    }
+    return terminal_buffer[live_row];
 }
 
 static void clear_row_range(int row, int start_col, int end_col, const TerminalState *state) {
@@ -334,6 +507,10 @@ static void scroll_up_one_line(TerminalState *state) {
         return;
     }
 
+    if (!state->alt_screen_active && top == 0 && bottom == term_rows - 1) {
+        push_history_line(terminal_buffer[top], state);
+    }
+
     selscroll_adjust(state, top, 1);
 
     for (int r = top + 1; r <= bottom; r++) {
@@ -397,9 +574,7 @@ static void reverse_index(TerminalState *state) {
         return;
     }
 
-    if (state->col >= term_cols) {
-        state->col = term_cols - 1;
-    }
+    cancel_pending_wrap(state);
     top = scroll_region_top(state);
     bottom = scroll_region_bottom(state);
 
@@ -436,9 +611,17 @@ static void clamp_cursor(TerminalState *state) {
     if (state->row < min_row) state->row = min_row;
     if (state->row > max_row) state->row = max_row;
     if (state->col < 0) state->col = 0;
-    if (state->col > term_cols) state->col = term_cols;
-    if (!state->autowrap_mode && state->col >= term_cols) {
-        state->col = term_cols - 1;
+    if (state->col >= term_cols) {
+        if (!(state->wrap_next && state->autowrap_mode && state->col == term_cols)) {
+            state->col = term_cols - 1;
+        }
+    }
+    if (state->col < 0) state->col = 0;
+    if (!state->autowrap_mode) {
+        state->wrap_next = 0;
+        if (state->col >= term_cols) {
+            state->col = term_cols - 1;
+        }
     }
 }
 
@@ -446,6 +629,9 @@ static void cancel_pending_wrap(TerminalState *state) {
     if (!state) {
         return;
     }
+    state->wrap_next = 0;
+    state->wrap_overwrite_next = 0;
+    /* Virtual cursor past last column (col == term_cols) folds to last cell. */
     if (state->col >= term_cols) {
         state->col = term_cols - 1;
     }
@@ -507,6 +693,8 @@ static void activate_alternate_screen(TerminalState *state) {
     state->scroll_top = -1;
     state->scroll_bottom = -1;
     state->utf8_len = 0;
+    state->wrap_next = 0;
+    state->scrollback_offset = 0;
 }
 
 static void deactivate_alternate_screen(TerminalState *state) {
@@ -524,6 +712,8 @@ static void deactivate_alternate_screen(TerminalState *state) {
     state->scroll_top = state->alt_saved_scroll_top;
     state->scroll_bottom = state->alt_saved_scroll_bottom;
     state->utf8_len = 0;
+    state->wrap_next = 0;
+    state->scrollback_offset = 0;
     clamp_cursor(state);
     mark_all_rows_dirty();
 }
@@ -533,6 +723,7 @@ static int parse_csi_params(const char *body, int body_len, int *params, int max
     int value = 0;
     int have_digits = 0;
     int saw_separator = 0;
+    int overflowed = 0;
 
     if (!body || body_len <= 0 || !params || max_params <= 0) {
         return 0;
@@ -545,8 +736,17 @@ static int parse_csi_params(const char *body, int body_len, int *params, int max
             if (!have_digits) {
                 value = 0;
                 have_digits = 1;
+                overflowed = 0;
             }
-            value = (value * 10) + (ch - '0');
+            if (!overflowed) {
+                int digit = ch - '0';
+                if (value > (INT_MAX - digit) / 10) {
+                    value = INT_MAX;
+                    overflowed = 1;
+                } else {
+                    value = (value * 10) + digit;
+                }
+            }
             saw_separator = 0;
         } else if (ch == ';') {
             if (count < max_params) {
@@ -555,6 +755,7 @@ static int parse_csi_params(const char *body, int body_len, int *params, int max
             value = 0;
             have_digits = 0;
             saw_separator = 1;
+            overflowed = 0;
         }
     }
 
@@ -599,6 +800,24 @@ static int csi_has_param(const int *params, int count, int value) {
         }
     }
     return 0;
+}
+
+static void put_codepoint(utf8proc_int32_t codepoint, TerminalState *state) {
+    utf8proc_uint8_t encoded[4];
+    utf8proc_ssize_t encoded_len;
+
+    if (!state) {
+        return;
+    }
+
+    encoded_len = utf8proc_encode_char(codepoint, encoded);
+    if (encoded_len <= 0) {
+        return;
+    }
+
+    for (utf8proc_ssize_t i = 0; i < encoded_len; i++) {
+        put_char((char)encoded[i], state);
+    }
 }
 
 static int utf8_expected_len(uint8_t lead) {
@@ -697,6 +916,7 @@ static void wrap_to_next_line(TerminalState *state) {
         terminal_buffer[state->row][term_cols - 1].attrs |= ATTR_WRAP;
     }
 
+    state->wrap_next = 0;
     state->col = 0;
     advance_row_with_scroll(state);
 }
@@ -978,6 +1198,7 @@ static void terminal_soft_reset(TerminalState *state) {
     state->autowrap_mode = 1;
     state->origin_mode = 0;
     state->insert_mode = 0;
+    state->wrap_next = 0;
 
     state->mouse_reporting_basic = 0;
     state->mouse_reporting_button = 0;
@@ -991,6 +1212,9 @@ static void terminal_soft_reset(TerminalState *state) {
 
     state->utf8_len = 0;
     state->csi_pending_len = 0;
+    state->str_ignore_active = 0;
+    state->str_ignore_esc_pending = 0;
+    state->scrollback_offset = 0;
     state->osc52_len = 0;
     state->osc52_pending = 0;
     osc_reset(state);
@@ -1004,6 +1228,7 @@ static void terminal_soft_reset(TerminalState *state) {
 void resize_terminal(int new_rows, int new_cols) {
     TerminalCell **new_primary;
     TerminalCell **new_alt = NULL;
+    TerminalCell **new_history = NULL;
     unsigned char *new_tabs = NULL;
     int old_rows = term_rows;
     int old_cols = term_cols;
@@ -1035,8 +1260,27 @@ void resize_terminal(int new_rows, int new_cols) {
         }
     }
 
+    if (history_buffer) {
+        new_history = resize_history_buffer(history_buffer, old_cols, new_cols);
+        if (!new_history) {
+            free_history_buffer(history_buffer);
+            history_buffer = NULL;
+            history_count = 0;
+            history_head = 0;
+        }
+    } else {
+        new_history = alloc_history_buffer(new_cols);
+        if (new_history) {
+            history_count = 0;
+            history_head = 0;
+        }
+    }
+
     primary_buffer = new_primary;
     alternate_buffer = new_alt;
+    if (new_history) {
+        history_buffer = new_history;
+    }
     term_rows = new_rows;
     term_cols = new_cols;
 
@@ -1076,6 +1320,9 @@ void resize_terminal(int new_rows, int new_cols) {
 
     term_state.scroll_top = -1;
     term_state.scroll_bottom = -1;
+    if (term_state.scrollback_offset > history_count) {
+        term_state.scrollback_offset = history_count;
+    }
 
     clamp_cursor(&term_state);
     if (term_state.saved_row < 0) term_state.saved_row = 0;
@@ -1105,6 +1352,12 @@ void initialize_terminal_state(TerminalState *state) {
         free(tab_stops);
         tab_stops = NULL;
     }
+    if (history_buffer) {
+        free_history_buffer(history_buffer);
+        history_buffer = NULL;
+    }
+    history_count = 0;
+    history_head = 0;
     free(dirty_rows);
     dirty_rows = NULL;
     terminal_buffer = NULL;
@@ -1128,6 +1381,10 @@ void initialize_terminal_state(TerminalState *state) {
     state->alt_saved_scroll_bottom = -1;
     state->title_dirty = 0;
     state->utf8_mode = 1;
+    state->scrollback_offset = 0;
+    state->wrap_next = 0;
+    state->str_ignore_active = 0;
+    state->str_ignore_esc_pending = 0;
     strncpy(state->window_title, "cupidterminal", sizeof(state->window_title) - 1);
 
     resize_terminal(24, 80);
@@ -1229,6 +1486,8 @@ void handle_ansi_sequence(const char *seq, int len, TerminalState *state,
             }
             if (csi_has_param(param_values, param_count, 7)) {
                 state->autowrap_mode = 0;
+                state->wrap_next = 0;
+                state->wrap_overwrite_next = 0;
                 if (state->col >= term_cols) {
                     state->col = term_cols - 1;
                 }
@@ -1290,7 +1549,10 @@ void handle_ansi_sequence(const char *seq, int len, TerminalState *state,
             if (report_row < 0) report_row = 0;
             if (report_row >= term_rows) report_row = term_rows - 1;
             if (report_col < 0) report_col = 0;
-            if (report_col >= term_cols) report_col = term_cols - 1;
+            /* CPR uses 1-based columns; virtual margin (col==term_cols) reports last column+1 */
+            if (report_col >= term_cols) {
+                report_col = term_cols - 1;
+            }
 
             n = snprintf(buf, sizeof(buf), "\033[%d;%dR", report_row + 1, report_col + 1);
             if (n > 0 && (size_t)n < sizeof(buf)) {
@@ -1324,6 +1586,7 @@ void handle_ansi_sequence(const char *seq, int len, TerminalState *state,
             if (r > max_row) r = max_row;
             if (c < 0) c = 0;
             if (c >= term_cols) c = term_cols - 1;
+            cancel_pending_wrap(state);
             state->row = r;
             state->col = c;
         } break;
@@ -1406,13 +1669,21 @@ void handle_ansi_sequence(const char *seq, int len, TerminalState *state,
             cancel_pending_wrap(state);
             state->col += n;
             if (state->col >= term_cols) {
-                state->col = state->autowrap_mode ? term_cols : term_cols - 1;
+                if (state->autowrap_mode && state->col == term_cols) {
+                    state->wrap_next = 1;
+                } else {
+                    state->col = term_cols - 1;
+                }
             }
         } break;
 
         case 'D': {
             int n = csi_param_default(param_values, param_count, 0, 1);
+            int was_margin = state->wrap_next && state->col >= term_cols;
             cancel_pending_wrap(state);
+            if (was_margin && n > 0) {
+                n--;
+            }
             state->col -= n;
             if (state->col < 0) state->col = 0;
         } break;
@@ -1465,9 +1736,7 @@ void handle_ansi_sequence(const char *seq, int len, TerminalState *state,
             int n = csi_param_default(param_values, param_count, 0, 1);
             cancel_pending_wrap(state);
             state->col += n;
-            if (state->col > term_cols) {
-                state->col = state->autowrap_mode ? term_cols : term_cols - 1;
-            }
+            if (state->col >= term_cols) state->col = term_cols - 1;
         } break;
 
         case 'h': {
@@ -1712,15 +1981,17 @@ void handle_ansi_sequence(const char *seq, int len, TerminalState *state,
 
         case 'b': {
             int n = csi_param_default(param_values, param_count, 0, 1);
-            int i;
-            int j;
+            utf8proc_int32_t codepoint;
+            ssize_t parsed;
 
             if (n <= 0 || n > 65535) break;
             if (state->lastc[0] == '\0') break;
-            for (i = 0; i < n; i++) {
-                for (j = 0; state->lastc[j] != '\0'; j++) {
-                    put_char(state->lastc[j], state);
-                }
+
+            parsed = utf8proc_iterate((const utf8proc_uint8_t *)state->lastc, -1, &codepoint);
+            if (parsed <= 0) break;
+
+            for (int i = 0; i < n; i++) {
+                put_codepoint(codepoint, state);
             }
         } break;
 
@@ -1749,10 +2020,17 @@ void put_char(char c, TerminalState *state) {
     if (state->row < 0) state->row = 0;
     if (state->row >= term_rows) state->row = term_rows - 1;
     if (state->col < 0) state->col = 0;
+    if (state->col > term_cols) {
+        state->col = term_cols;
+    }
+    if (state->col >= term_cols && !(state->wrap_next && state->col == term_cols && state->autowrap_mode)) {
+        state->col = term_cols - 1;
+    }
 
     if (c == '\b') {
         state->utf8_len = 0;
-        if (state->col >= term_cols) {
+        if (state->wrap_next) {
+            state->wrap_next = 0;
             state->col = term_cols - 1;
         } else if (state->col > 0) {
             state->col--;
@@ -1767,11 +2045,12 @@ void put_char(char c, TerminalState *state) {
 
     if (c == '\t') {
         state->utf8_len = 0;
-        if (state->col >= term_cols) {
-            state->col = term_cols - 1;
+        if (state->wrap_next) {
+            /* Stay on virtual margin; next printable overwrites last column (xterm-style). */
+            state->col = term_cols;
+            state->wrap_overwrite_next = 1;
             return;
         }
-
         state->col = next_tab_stop_col(state->col);
         return;
     }
@@ -1791,6 +2070,7 @@ void put_char(char c, TerminalState *state) {
 
     if (c == '\r') {
         state->utf8_len = 0;
+        cancel_pending_wrap(state);
         state->col = 0;
         return;
     }
@@ -1867,7 +2147,7 @@ void put_char(char c, TerminalState *state) {
             if (width == 0) {
                 int target_col;
 
-                if (state->col >= term_cols) {
+                if (state->wrap_next) {
                     target_col = term_cols - 1;
                 } else {
                     target_col = state->col - 1;
@@ -1878,11 +2158,24 @@ void put_char(char c, TerminalState *state) {
                 return;
             }
 
-            if (state->col >= term_cols) {
+            if (state->wrap_next) {
                 if (state->autowrap_mode) {
-                    wrap_to_next_line(state);
+                    if (state->col == term_cols && state->wrap_overwrite_next) {
+                        state->wrap_overwrite_next = 0;
+                        state->wrap_next = 0;
+                        state->col = term_cols - 1;
+                    } else {
+                        state->wrap_next = 0;
+                        state->wrap_overwrite_next = 0;
+                        state->col = 0;
+                        advance_row_with_scroll(state);
+                    }
                 } else {
-                    state->col = term_cols - 1;
+                    state->wrap_next = 0;
+                    state->wrap_overwrite_next = 0;
+                    if (state->col >= term_cols) {
+                        state->col = term_cols - 1;
+                    }
                 }
             }
 
@@ -1937,9 +2230,12 @@ void put_char(char c, TerminalState *state) {
                 terminal_buffer[row][col + 1].is_continuation = 1;
             }
 
-            state->col += width;
-            if (!state->autowrap_mode && state->col >= term_cols) {
-                state->col = term_cols - 1;
+            if (col + width < term_cols) {
+                state->col = col + width;
+                state->wrap_next = 0;
+            } else {
+                state->col = state->autowrap_mode ? term_cols : term_cols - 1;
+                state->wrap_next = state->autowrap_mode ? 1 : 0;
             }
             state->utf8_len = 0;
         } else {
@@ -1977,6 +2273,29 @@ void terminal_consume_bytes(const uint8_t *bytes, size_t len, TerminalState *sta
 
     size_t i = 0;
     while (i < buflen) {
+        if (state->str_ignore_active) {
+            uint8_t b = buf[i++];
+
+            if (state->str_ignore_esc_pending) {
+                if (b == '\\') {
+                    state->str_ignore_active = 0;
+                    state->str_ignore_esc_pending = 0;
+                    continue;
+                }
+                state->str_ignore_esc_pending = 0;
+            }
+
+            if (b == 0x9C || b == 0x18 || b == 0x1A) {
+                state->str_ignore_active = 0;
+                state->str_ignore_esc_pending = 0;
+                continue;
+            }
+            if (b == 0x1B) {
+                state->str_ignore_esc_pending = 1;
+            }
+            continue;
+        }
+
         if (state->osc_active) {
             uint8_t b = buf[i++];
 
@@ -1989,7 +2308,7 @@ void terminal_consume_bytes(const uint8_t *bytes, size_t len, TerminalState *sta
                 state->osc_esc_pending = 0;
             }
 
-            if (b == 0x07) {
+            if (b == 0x07 || b == 0x9C || b == 0x18 || b == 0x1A) {
                 osc_finalize(state);
                 continue;
             }
@@ -2138,6 +2457,13 @@ void terminal_consume_bytes(const uint8_t *bytes, size_t len, TerminalState *sta
                 continue;
             }
 
+            if (buf[i] == 'P' || buf[i] == '_' || buf[i] == '^') {
+                i++;
+                state->str_ignore_active = 1;
+                state->str_ignore_esc_pending = 0;
+                continue;
+            }
+
             /* DECKPAM (ESC =) and DECKPNM (ESC >) – keypad mode switches.
              * Must be consumed here; without this the '=' or '>' byte falls
              * through to put_char() and is printed literally in the prompt. */
@@ -2154,6 +2480,11 @@ void terminal_consume_bytes(const uint8_t *bytes, size_t len, TerminalState *sta
 
         {
             uint8_t b = buf[i++];
+            if (state->utf8_len == 0 && b == 0x84) {
+                cancel_pending_wrap(state);
+                advance_row_with_scroll(state);
+                continue;
+            }
             if (b == 0x0E) {  /* SO: invoke G1 into GL */
                 state->gl = 1;
                 state->utf8_len = 0;
@@ -2186,6 +2517,72 @@ void terminal_consume_bytes(const uint8_t *bytes, size_t len, TerminalState *sta
                 if (tab_stops && state->col >= 0 && state->col < term_cols) {
                     tab_stops[state->col] = 1;
                 }
+                continue;
+            }
+            if (state->utf8_len == 0 && b == 0x8D) {
+                state->utf8_len = 0;
+                reverse_index(state);
+                continue;
+            }
+            if (state->utf8_len == 0 && b == 0x90) {
+                state->utf8_len = 0;
+                state->str_ignore_active = 1;
+                state->str_ignore_esc_pending = 0;
+                continue;
+            }
+            if (state->utf8_len == 0 && b == 0x9B) {
+                size_t start = i - 1;
+                size_t q = i;
+
+                while (q < buflen && !(buf[q] >= '@' && buf[q] <= '~')) {
+                    q++;
+                }
+                if (q < buflen) {
+                    size_t seq_len = q - start + 1;
+                    char seq_buf[CSI_PENDING_MAX + 4];
+
+                    if (seq_len > CSI_PENDING_MAX) {
+                        seq_len = CSI_PENDING_MAX;
+                    }
+                    seq_buf[0] = '\033';
+                    seq_buf[1] = '[';
+                    if (seq_len > 1) {
+                        memcpy(seq_buf + 2, buf + start + 1, seq_len - 1);
+                    }
+                    handle_ansi_sequence(seq_buf, (int)(seq_len + 1), state, response_fn, response_ctx);
+                    i = q + 1;
+                    continue;
+                }
+
+                {
+                    size_t tail = buflen - start;
+                    if (tail > 0 && tail <= CSI_PENDING_MAX) {
+                        memcpy(state->csi_pending, buf + start, tail);
+                        state->csi_pending_len = (int)tail;
+                    }
+                }
+                break;
+            }
+            if (state->utf8_len == 0 && b == 0x9C) {
+                state->utf8_len = 0;
+                if (state->osc_active) {
+                    osc_finalize(state);
+                }
+                state->str_ignore_active = 0;
+                state->str_ignore_esc_pending = 0;
+                continue;
+            }
+            if (state->utf8_len == 0 && b == 0x9D) {
+                state->utf8_len = 0;
+                state->osc_active = 1;
+                state->osc_esc_pending = 0;
+                state->osc_len = 0;
+                continue;
+            }
+            if (state->utf8_len == 0 && (b == 0x9E || b == 0x9F)) {
+                state->utf8_len = 0;
+                state->str_ignore_active = 1;
+                state->str_ignore_esc_pending = 0;
                 continue;
             }
             if (state->utf8_len == 0 && b == 0x9A && response_fn && vtiden) {

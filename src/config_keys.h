@@ -9,9 +9,7 @@
 static MouseShortcut mshortcuts[] = {
 	{ XK_ANY_MOD,   2, selpaste, {.i = 0}, 1 },
 	{ ShiftMask,    4, ttysend,  {.s = "\033[5;2~"}, 0 },
-	{ XK_ANY_MOD,   4, ttysend,  {.s = "\031"}, 0 },
 	{ ShiftMask,    5, ttysend,  {.s = "\033[6;2~"}, 0 },
-	{ XK_ANY_MOD,   5, ttysend,  {.s = "\005"}, 0 },
 };
 
 /* Keyboard shortcuts */
