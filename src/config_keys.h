@@ -15,9 +15,11 @@ static MouseShortcut mshortcuts[] = {
 /* Keyboard shortcuts */
 static Shortcut shortcuts[] = {
 	{ XK_ANY_MOD,     XK_Break,       sendbreak,   {.i = 0} },
-	{ TERMMOD,        XK_Prior,       zoom,        {.f = +1} },
-	{ TERMMOD,        XK_Next,        zoom,        {.f = -1} },
-	{ TERMMOD,        XK_Home,        zoomreset,   {.f = 0} },
+	{ ControlMask,    XK_equal,       zoom,        {.f = +1} },
+	{ ControlMask|ShiftMask, XK_plus, zoom,        {.f = +1} },
+	{ ControlMask,    XK_KP_Add,      zoom,        {.f = +1} },
+	{ ControlMask,    XK_minus,       zoom,        {.f = -1} },
+	{ ControlMask,    XK_KP_Subtract, zoom,        {.f = -1} },
 	{ TERMMOD,        XK_C,           clipcopy,    {.i = 0} },
 	{ TERMMOD,        XK_V,           clippaste,   {.i = 0} },
 	{ TERMMOD,        XK_Y,           selpaste,    {.i = 0} },

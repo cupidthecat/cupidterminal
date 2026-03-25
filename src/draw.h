@@ -25,6 +25,7 @@ void cleanup_xft(void);
 void xy_to_cell(int x, int y, int *row, int *col);
 void xft_zoom(Display *display, Window window, float delta);
 void xft_zoom_reset(Display *display, Window window);
+void xft_set_font_change_hook(void (*hook)(Display *display, Window window));
 
 /* XIM input method support */
 extern XIC g_xic;

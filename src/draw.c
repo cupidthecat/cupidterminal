@@ -179,10 +179,15 @@ void xim_focus_out(void) {
    Avoids an XGetWindowAttributes() round-trip on every frame. */
 static int cached_win_w = 0;
 static int cached_win_h = 0;
+static void (*font_change_hook)(Display *, Window) = NULL;
 
 void draw_notify_resize(int w, int h) {
     cached_win_w = w;
     cached_win_h = h;
+}
+
+void xft_set_font_change_hook(void (*hook)(Display *display, Window window)) {
+    font_change_hook = hook;
 }
 
 #define COLOR_CACHE_SIZE (COLOR_DEFAULT_BG + 1)
@@ -190,6 +195,7 @@ static XftColor color_cache[COLOR_CACHE_SIZE];
 static int color_allocated[COLOR_CACHE_SIZE] = {0};
 static XftColor faint_color_cache[COLOR_CACHE_SIZE];
 static int faint_color_allocated[COLOR_CACHE_SIZE] = {0};
+static int draw_full_refresh;
 
 /* Open-addressing hash table for true-RGB XftColor allocation.
  * key == 0 is the empty-slot sentinel; no valid true-RGB key is 0 because
@@ -903,20 +909,20 @@ void initialize_xft(Display *display, Window window) {
     }
 }
 
-static void xft_reload_fonts(Display *display) {
+static int xft_reload_fonts(Display *display) {
     double sz = usedfontsize;
     XftFont *nf, *nb, *ni, *nbi, *ne;
     XftFont *of = xft_font, *ob = xft_font_bold, *oi = xft_font_italic,
             *obi = xft_font_bold_italic, *oe = xft_font_emoji;
 
-    if (sz < 6.0) sz = 6.0;
-    if (sz > 256.0) sz = 256.0;
+    if (sz < minfontsize) sz = minfontsize;
+    if (sz > maxfontsize) sz = maxfontsize;
 
     clear_glyph_fallback_cache(display);
 
     /* st xloadfonts: fontsize > 1 forces FC_PIXEL_SIZE */
     if (load_font_set(display, FONT, sz, &nf, &nb, &ni, &nbi, &ne) != 0)
-        return;
+        return -1;
 
     xft_font = nf;
     xft_font_bold = nb;
@@ -927,21 +933,25 @@ static void xft_reload_fonts(Display *display) {
     free_font_set(display, of, ob, oi, obi, oe);
 
     recompute_cell_metrics(display);
+    draw_full_refresh = 1;
+    mark_all_rows_dirty_local();
+    return 0;
 }
 
 void xft_zoom(Display *display, Window window, float delta) {
-    (void)window;
     usedfontsize += delta;
-    if (usedfontsize < 6) usedfontsize = 6;
-    if (usedfontsize > 256) usedfontsize = 256;
-    xft_reload_fonts(display);
+    if (usedfontsize < minfontsize) usedfontsize = minfontsize;
+    if (usedfontsize > maxfontsize) usedfontsize = maxfontsize;
+    if (xft_reload_fonts(display) == 0 && font_change_hook)
+        font_change_hook(display, window);
 }
 
 void xft_zoom_reset(Display *display, Window window) {
-    (void)window;
-    usedfontsize = defaultfontsize;
-    if (usedfontsize < 6) usedfontsize = 6;
-    xft_reload_fonts(display);
+    usedfontsize = (defaultfontsize > 0.0) ? defaultfontsize : usedfontsize;
+    if (usedfontsize < minfontsize) usedfontsize = minfontsize;
+    if (usedfontsize > maxfontsize) usedfontsize = maxfontsize;
+    if (xft_reload_fonts(display) == 0 && font_change_hook)
+        font_change_hook(display, window);
 }
 
 // Cleanup Xft resources

@@ -92,7 +92,7 @@ void selpaste(const Arg *arg) {
 
 void zoom(const Arg *arg) {
     if (global_display && global_window) {
-        xft_zoom(global_display, global_window, arg->f);
+        xft_zoom(global_display, global_window, arg->f * zoomstep);
     }
 }
 

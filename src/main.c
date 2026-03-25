@@ -137,6 +137,10 @@ static void sync_pty_winsize_from_window(Display *display, Window window, PtySes
     resize_terminal(ws_row, ws_col);
 }
 
+static void on_font_metrics_changed(Display *display, Window window) {
+    sync_pty_winsize_from_window(display, window, &g_pty_session);
+}
+
 static void pty_response_cb(const uint8_t *bytes, size_t len, void *ctx) {
     PtySession *session = (PtySession *)ctx;
     if (session && session->master_fd >= 0 && len > 0) {
@@ -289,6 +293,7 @@ run:
     }
 
     initialize_xft(display, window);
+    xft_set_font_change_hook(on_font_metrics_changed);
     {
         XWindowAttributes wa_init;
         if (XGetWindowAttributes(display, window, &wa_init)) {

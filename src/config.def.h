@@ -66,6 +66,9 @@ extern char *opt_font;
 static int borderpx __attribute__((unused)) = 2;
 extern double usedfontsize;
 extern double defaultfontsize;
+static float zoomstep __attribute__((unused)) = 1.0f;
+static double minfontsize __attribute__((unused)) = 6.0;
+static double maxfontsize __attribute__((unused)) = 256.0;
 
 /* Shell and execution */
 static char *shell __attribute__((unused)) = "/bin/bash";
