@@ -4,6 +4,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+/*
+ * No-op win.h stubs for unit tests.
+ * st.c now calls xsettitle/xbell at parse time; tests must satisfy the
+ * linker without pulling in X11.  These are intentionally silent.
+ */
+void xbell(void) {}
+void xsettitle(char *p) { (void)p; }
+void xsetsel(char *str) { (void)str; }
+
 /* Provide config symbols for terminal_state (used when not linking with main.c) */
 unsigned int tabspaces = 8;
 char *vtiden = "\033[?6c";
@@ -15,28 +24,28 @@ static void failf(const char *message) {
 }
 
 void test_reset_terminal(int rows, int cols) {
-    initialize_terminal_state(&term_state);
+    tnew(&term);
     if (rows > 0 && cols > 0) {
-        resize_terminal(rows, cols);
+        tresize(rows, cols);
     }
-    term_state.row = 0;
-    term_state.col = 0;
+    term.row = 0;
+    term.col = 0;
     /* Clear screen so tests don't see leftover from previous test (same-size resize skips realloc) */
     static const char ed2[] = "\x1b[2J";
-    terminal_consume_bytes((const uint8_t *)ed2, sizeof(ed2) - 1, &term_state, NULL, NULL);
-    term_state.row = 0;
-    term_state.col = 0;
+    twrite((const uint8_t *)ed2, sizeof(ed2) - 1, &term, NULL, NULL);
+    term.row = 0;
+    term.col = 0;
 }
 
 void test_feed_bytes(const uint8_t *bytes, size_t len) {
-    terminal_consume_bytes(bytes, len, &term_state, NULL, NULL);
+    twrite(bytes, len, &term, NULL, NULL);
 }
 
 void test_feed_string(const char *s) {
     if (!s) {
         return;
     }
-    terminal_consume_bytes((const uint8_t *)s, strlen(s), &term_state, NULL, NULL);
+    twrite((const uint8_t *)s, strlen(s), &term, NULL, NULL);
 }
 
 void test_assert_true(int condition, const char *message) {
@@ -45,14 +54,16 @@ void test_assert_true(int condition, const char *message) {
     }
 }
 
-void test_assert_cell(int row, int col, const char *glyph, uint32_t fg, uint32_t bg, uint16_t attrs) {
-    const char *actual = terminal_buffer[row][col].c;
+void test_assert_cell(int row, int col, const char *glyph, uint32_t fg, uint32_t bg, uint16_t mode) {
+    char cluster[64];
+    term_render_cluster(row, col, cluster, sizeof cluster);
+    const char *actual = cluster;
     const char *expected = glyph ? glyph : "";
 
     if (strcmp(actual, expected) != 0 ||
-        terminal_buffer[row][col].fg != fg ||
-        terminal_buffer[row][col].bg != bg ||
-        terminal_buffer[row][col].attrs != attrs) {
+        term_lines[row].line[col].fg != fg ||
+        term_lines[row].line[col].bg != bg ||
+        term_lines[row].line[col].mode != mode) {
         fprintf(stderr,
             "TEST FAILURE: cell[%d,%d] expected ('%s',%u,%u,%u) got ('%s',%u,%u,%u)\n",
             row,
@@ -60,37 +71,37 @@ void test_assert_cell(int row, int col, const char *glyph, uint32_t fg, uint32_t
             expected,
             fg,
             bg,
-            attrs,
+            mode,
             actual,
-            terminal_buffer[row][col].fg,
-            terminal_buffer[row][col].bg,
-            terminal_buffer[row][col].attrs);
+            term_lines[row].line[col].fg,
+            term_lines[row].line[col].bg,
+            term_lines[row].line[col].mode);
         exit(EXIT_FAILURE);
     }
 }
 
 void test_assert_cursor(int row, int col) {
-    if (term_state.row != row || term_state.col != col) {
+    if (term.row != row || term.col != col) {
         fprintf(stderr,
             "TEST FAILURE: cursor expected (%d,%d), got (%d,%d)\n",
             row,
             col,
-            term_state.row,
-            term_state.col);
+            term.row,
+            term.col);
         exit(EXIT_FAILURE);
     }
 }
 
-void test_assert_attrs(uint32_t fg, uint32_t bg, uint16_t attrs) {
-    if (term_state.current_fg != fg || term_state.current_bg != bg || term_state.current_attrs != attrs) {
+void test_assert_attrs(uint32_t fg, uint32_t bg, uint16_t mode) {
+    if (term.current_fg != fg || term.current_bg != bg || term.current_mode != mode) {
         fprintf(stderr,
-            "TEST FAILURE: current attrs expected (%u,%u,%u), got (%u,%u,%u)\n",
+            "TEST FAILURE: current mode expected (%u,%u,%u), got (%u,%u,%u)\n",
             fg,
             bg,
-            attrs,
-            term_state.current_fg,
-            term_state.current_bg,
-            term_state.current_attrs);
+            mode,
+            term.current_fg,
+            term.current_bg,
+            term.current_mode);
         exit(EXIT_FAILURE);
     }
 }
@@ -118,11 +129,12 @@ char *test_snapshot_screen(void) {
 
     for (int r = 0; r < term_rows; r++) {
         for (int c = 0; c < term_cols; c++) {
-            const char *g = terminal_buffer[r][c].c;
+            char cluster[64];
+            size_t n = term_render_cluster(r, c, cluster, sizeof cluster);
             char ch = ' ';
-            if (g[0] != '\0') {
-                if (((unsigned char)g[0]) < 0x80 && g[1] == '\0') {
-                    ch = g[0];
+            if (n > 0) {
+                if (((unsigned char)cluster[0]) < 0x80 && cluster[1] == '\0') {
+                    ch = cluster[0];
                 } else {
                     ch = '*';
                 }

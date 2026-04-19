@@ -15,10 +15,10 @@ int main(void) {
     test_feed_string(wide);
     test_feed_string("B");
     test_assert_cell(0, 0, "A", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
-    test_assert_cell(0, 1, wide, COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
-    test_assert_cell(0, 2, "", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
-    test_assert_true(terminal_buffer[0][1].width == 2, "wide lead width mismatch");
-    test_assert_true(terminal_buffer[0][2].is_continuation == 1, "wide continuation flag mismatch");
+    test_assert_cell(0, 1, wide, COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, ATTR_WIDE);
+    test_assert_cell(0, 2, "", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, ATTR_WDUMMY);
+    test_assert_true(term_lines[0].line[1].mode & ATTR_WIDE, "wide lead ATTR_WIDE mismatch");
+    test_assert_true(term_lines[0].line[2].mode & ATTR_WDUMMY, "wide continuation ATTR_WDUMMY mismatch");
     test_assert_cell(0, 3, "B", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
     test_assert_cursor(0, 4);
 
@@ -28,24 +28,24 @@ int main(void) {
     test_assert_cell(0, 0, "A", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
     test_assert_cell(0, 1, "B", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
     test_assert_cell(0, 2, "C", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
-    test_assert_cell(1, 0, wide, COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
-    test_assert_cell(1, 1, "", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
-    test_assert_true(terminal_buffer[1][1].is_continuation == 1, "wrapped wide continuation missing");
+    test_assert_cell(1, 0, wide, COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, ATTR_WIDE);
+    test_assert_cell(1, 1, "", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, ATTR_WDUMMY);
+    test_assert_true(term_lines[1].line[1].mode & ATTR_WDUMMY, "wrapped wide continuation ATTR_WDUMMY missing");
     test_assert_cursor(1, 2);
 
     test_reset_terminal(2, 8);
     test_feed_string("e");
     test_feed_string(combining);
     test_feed_string("x");
-    test_assert_cell(0, 0, "e\xCC\x81", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
+    test_assert_cell(0, 0, "e\xCC\x81", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, ATTR_HASCOMB);
     test_assert_cell(0, 1, "x", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
     test_assert_cursor(0, 2);
 
     test_reset_terminal(2, 8);
     test_feed_string(wide);
     test_feed_string(combining);
-    test_assert_cell(0, 0, wide_combined, COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
-    test_assert_cell(0, 1, "", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
+    test_assert_cell(0, 0, wide_combined, COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, ATTR_HASCOMB | ATTR_WIDE);
+    test_assert_cell(0, 1, "", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, ATTR_WDUMMY);
     test_assert_cursor(0, 2);
 
     test_reset_terminal(2, 8);

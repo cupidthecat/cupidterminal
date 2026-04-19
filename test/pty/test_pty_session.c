@@ -10,7 +10,11 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "../../src/pty_session.h"
+#include "../../src/pty.h"
+
+char *utmp = NULL;
+char *scroll = NULL;
+char *stty_args = "stty raw pass8 nl -echo -iexten -cstopb 38400";
 
 static void die(const char *msg) {
     perror(msg);
@@ -34,7 +38,8 @@ int main(void) {
     struct winsize ws;
     int reaped = 0;
 
-    if (pty_session_spawn(&session, "/bin/cat", "xterm-256color") == -1) {
+    char *cat_argv[] = { "/bin/cat", NULL };
+    if (pty_session_spawn(&session, NULL, "/bin/sh", cat_argv, "xterm-256color") == -1) {
         die("pty_session_spawn");
     }
 

@@ -1,5 +1,5 @@
 /*
- * SGR edge-case tests: bright colors, 256-color, combined attrs.
+ * SGR edge-case tests: bright colors, 256-color, combined mode.
  */
 #include "../common/test_common.h"
 

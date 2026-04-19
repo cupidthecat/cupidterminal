@@ -64,6 +64,21 @@ int main(void) {
     test_feed_string("\x1b[1m\x1b[;31mA");
     test_assert_cell(0, 0, "A", 1, COLOR_DEFAULT_BG, 0);
 
+    /* REP: repeat last printable character n times (including multibyte UTF-8) */
+    test_reset_terminal(2, 8);
+    test_feed_string("\xC3\xA9\x1b[3b");
+    test_assert_cell(0, 0, "\xC3\xA9", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
+    test_assert_cell(0, 1, "\xC3\xA9", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
+    test_assert_cell(0, 2, "\xC3\xA9", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
+    test_assert_cell(0, 3, "\xC3\xA9", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
+    test_assert_cursor(0, 4);
+
+    /* Huge CSI params should clamp safely instead of overflowing. */
+    test_reset_terminal(3, 6);
+    test_feed_string("\x1b[999999999999999999;2H@");
+    test_assert_cell(2, 1, "@", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
+    test_assert_cursor(2, 2);
+
     test_print_ok("parser/csi_params");
     return 0;
 }

@@ -5,7 +5,7 @@ CFLAGS = -Wall -Wextra -Werror -std=c99 -O2 -fPIC -I/usr/include/X11 -I/usr/incl
 LDFLAGS = -lX11 -lXft -lfreetype -lutf8proc -lfontconfig
 TEST_CFLAGS = $(CFLAGS) -Itest/common -Itest
 
-SRCS = src/main.c src/draw.c src/input.c src/terminal_state.c src/pty_session.c
+SRCS = src/xwin.c src/cupid.c src/pty.c
 OBJS = $(SRCS:src/%.c=build/%.o)
 TARGET = cupidterminal
 
@@ -24,7 +24,7 @@ SCREEN_TEST_BINS := $(patsubst test/screen/%.c,$(TEST_BIN_DIR)/screen_%,$(SCREEN
 UTF8_TEST_BINS := $(patsubst test/utf8/%.c,$(TEST_BIN_DIR)/utf8_%,$(UTF8_TEST_SRCS))
 PTY_TEST_BINS := $(patsubst test/pty/%.c,$(TEST_BIN_DIR)/pty_%,$(PTY_TEST_SRCS))
 
-.PHONY: all clean test test-all test-parser test-screen test-utf8 test-pty test-manual install install-terminfo
+.PHONY: all clean test test-all test-parser test-screen test-utf8 test-pty test-manual install install-terminfo check-no-x11
 
 PREFIX ?= /usr/local
 BINDIR = $(PREFIX)/bin
@@ -52,26 +52,37 @@ build/%.o: src/%.c src/config.h
 $(TEST_BIN_DIR):
 	mkdir -p $(TEST_BIN_DIR)
 
-$(TEST_COMMON_OBJ): $(TEST_COMMON_SRC) test/common/test_common.h src/terminal_state.h
+$(TEST_COMMON_OBJ): $(TEST_COMMON_SRC) test/common/test_common.h src/cupid.h
 	mkdir -p build
 	$(CC) $(TEST_CFLAGS) -c $< -o $@
 
-$(TEST_BIN_DIR)/parser_%: test/parser/%.c $(TEST_COMMON_OBJ) build/terminal_state.o src/config.h | $(TEST_BIN_DIR)
-	$(CC) $(TEST_CFLAGS) $< $(TEST_COMMON_OBJ) build/terminal_state.o -o $@ -lutf8proc
+# cupid_test.o: cupid.c compiled without main() and argv globals (for unit tests)
+build/cupid_test.o: src/cupid.c src/config.h
+	mkdir -p build
+	$(CC) $(TEST_CFLAGS) -DCUPID_NO_MAIN -c src/cupid.c -o $@
 
-$(TEST_BIN_DIR)/screen_%: test/screen/%.c $(TEST_COMMON_OBJ) build/terminal_state.o src/config.h | $(TEST_BIN_DIR)
-	$(CC) $(TEST_CFLAGS) $< $(TEST_COMMON_OBJ) build/terminal_state.o -o $@ -lutf8proc
+$(TEST_BIN_DIR)/parser_%: test/parser/%.c $(TEST_COMMON_OBJ) build/cupid_test.o src/config.h | $(TEST_BIN_DIR)
+	$(CC) $(TEST_CFLAGS) $< $(TEST_COMMON_OBJ) build/cupid_test.o -o $@ -lutf8proc
 
-$(TEST_BIN_DIR)/utf8_%: test/utf8/%.c $(TEST_COMMON_OBJ) build/terminal_state.o src/config.h | $(TEST_BIN_DIR)
-	$(CC) $(TEST_CFLAGS) $< $(TEST_COMMON_OBJ) build/terminal_state.o -o $@ -lutf8proc
+$(TEST_BIN_DIR)/screen_%: test/screen/%.c $(TEST_COMMON_OBJ) build/cupid_test.o src/config.h | $(TEST_BIN_DIR)
+	$(CC) $(TEST_CFLAGS) $< $(TEST_COMMON_OBJ) build/cupid_test.o -o $@ -lutf8proc
 
-$(TEST_BIN_DIR)/pty_%: test/pty/%.c build/pty_session.o src/config.h | $(TEST_BIN_DIR)
-	$(CC) $(TEST_CFLAGS) $< build/pty_session.o -o $@
+$(TEST_BIN_DIR)/utf8_%: test/utf8/%.c $(TEST_COMMON_OBJ) build/cupid_test.o src/config.h | $(TEST_BIN_DIR)
+	$(CC) $(TEST_CFLAGS) $< $(TEST_COMMON_OBJ) build/cupid_test.o -o $@ -lutf8proc
+
+$(TEST_BIN_DIR)/pty_%: test/pty/%.c build/pty.o src/config.h | $(TEST_BIN_DIR)
+	$(CC) $(TEST_CFLAGS) $< build/pty.o -o $@
 
 clean:
 	rm -rf build $(TARGET)
 
-test: test-all
+check-no-x11:
+	@if grep -nE 'Xlib|Xft|XEvent|XStoreName|XBell|XParse|XSet[A-Z]|XGet[A-Z]|XCreate[A-Z]|Display[ \t*]|Window[ \t*]|XColor|Xrender|Mod[0-9]Mask|ShiftMask|ControlMask|KeySym|XK_' src/cupid.c; then \
+		echo "ERROR: Xlib symbols leaked into src/cupid.c"; exit 1; \
+	fi
+	@echo "OK: src/cupid.c is X11-clean"
+
+test: check-no-x11 test-all
 
 test-all: test-parser test-screen test-utf8 test-pty
 	@echo "All automated test suites PASSED."

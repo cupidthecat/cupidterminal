@@ -13,7 +13,7 @@ int main(void) {
     test_assert_cell(0, 2, "B", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
 
     test_feed_string(emoji);
-    test_assert_cell(0, 3, emoji, COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
+    test_assert_cell(0, 3, emoji, COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, ATTR_WIDE);
 
     test_print_ok("utf8/cells");
     return 0;

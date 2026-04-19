@@ -23,8 +23,8 @@ int main(void) {
     test_assert_cell(0, 1, "A", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
 
     test_feed_bytes(emoji_part2, sizeof(emoji_part2));
-    test_assert_cell(0, 2, emoji, COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
-    test_assert_true(term_state.col > 2, "cursor should advance after completed 4-byte UTF-8 sequence");
+    test_assert_cell(0, 2, emoji, COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, ATTR_WIDE);
+    test_assert_true(term.col > 2, "cursor should advance after completed 4-byte UTF-8 sequence");
 
     test_print_ok("utf8/incomplete_sequences");
     return 0;

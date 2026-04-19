@@ -7,7 +7,11 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include "../../src/pty_session.h"
+#include "../../src/pty.h"
+
+char *utmp = NULL;
+char *scroll = NULL;
+char *stty_args = "stty raw pass8 nl -echo -iexten -cstopb 38400";
 
 static void fail(const char *msg) {
     fprintf(stderr, "TEST FAILURE: %s\n", msg);
@@ -32,7 +36,7 @@ int main(void) {
     int status = 0;
     int reaped = 0;
 
-    if (pty_session_spawn(&session, "/bin/sh", "xterm-256color") == -1) {
+    if (pty_session_spawn(&session, NULL, "/bin/sh", NULL, "xterm-256color") == -1) {
         fail("pty_session_spawn failed");
     }
 
