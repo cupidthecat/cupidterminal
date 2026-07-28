@@ -97,13 +97,18 @@ typedef struct {
     int wrap_overwrite_next; /* HT at margin: next printable overwrites last col, same row */
     int lnm_mode;          /* LNM 20: LF sends CR+LF */
     int echo_mode;         /* SRM 12: echo input to display */
+    int print_mode;        /* MC 5/4 or -o: mirror incoming text */
 
     /* Mouse reporting: ?1000 basic, ?1002 button event, ?1003 any motion, ?1006 SGR */
     int mouse_reporting_basic;   /* 1000: press/release */
     int mouse_reporting_button;  /* 1002: + motion while pressed */
     int mouse_reporting_any;     /* 1003: + motion always */
+    int mouse_reporting_x10;     /* 9: press-only X10 protocol */
     int mouse_sgr_mode;          /* 1006: use <b;x;y;M/m format */
     int application_cursor_keys; /* DECCKM ?1: use SS3 O? for arrows */
+    int application_keypad;      /* DECPAM/DECPNM: application keypad */
+    int keyboard_lock;           /* KAM 2: suppress keyboard input */
+    int meta_eight_bit;          /* DECSET 1034: Meta sets the high bit */
 
     int alt_saved_row;
     int alt_saved_col;
@@ -121,6 +126,7 @@ typedef struct {
 
     int osc_active;
     int osc_esc_pending;
+    int osc_overflow;
     char osc_buf[512];
     int osc_len;
     uint8_t osc52_buf[8192];
@@ -143,10 +149,12 @@ typedef struct {
     /* Cursor shape: 0-2 block, 3-4 underline, 5-6 bar, 7 snowman (DECSCUSR) */
     int cursorshape;
 
-    /* G0/G1 charset: 0=USA/ASCII, 1=DEC Special Graphics (box drawing) */
+    /* G0-G3 charsets: 0=USA/ASCII, 1=DEC Special Graphics (box drawing) */
     int charset_g0;
     int charset_g1;
-    int gl;  /* 0=G0 in GL, 1=G1 in GL (SO/SI) */
+    int charset_g2;
+    int charset_g3;
+    int gl;  /* active G0-G3 table in GL */
 
     /* DECSET 1004: send \033[I/\033[O on focus in/out */
     int focus_mode;
@@ -218,5 +226,10 @@ char *getsel(void);   /* malloc'd UTF-8 of current selection; caller frees */
 
 /* ---- PTY write (owns echo-mode and lnm-mode expansion) ------------- */
 void ttywrite(const char *s, size_t n, int may_echo);
+int tprinter_open(const char *path);
+void tprinter_close(void);
+void tprinter_toggle(void);
+void tprinter_screen(void);
+void tprinter_selection(void);
 
 #endif // CUPID_H

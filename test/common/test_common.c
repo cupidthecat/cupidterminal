@@ -13,10 +13,14 @@ void xbell(void) {}
 void xsettitle(char *p) { (void)p; }
 void xsetsel(char *str) { (void)str; }
 
-/* Provide config symbols for terminal_state (used when not linking with main.c) */
+/* Provide config symbols for cupid.c when building without its main(). */
 unsigned int tabspaces = 8;
 char *vtiden = "\033[?6c";
 int allowwindowops = 1;  /* enable OSC 52 for unit tests */
+int allowaltscreen = 1;
+char *utmp = NULL;
+char *scroll = NULL;
+char *stty_args = "stty raw pass8 nl -echo -iexten -cstopb 38400";
 
 static void failf(const char *message) {
     fprintf(stderr, "TEST FAILURE: %s\n", message);

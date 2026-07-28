@@ -1,6 +1,10 @@
 # cupidterminal
 
-cupidterminal is a minimalist X11 terminal emulator. It is architecturally inspired by suckless **st** but is its own codebase with its own filenames and roadmap. The project is built around a strict separation between terminal logic and the X11 layer so the parser can be reasoned about, tested, and ported without ever touching Xlib.
+cupidterminal is a minimalist X11 terminal emulator derived from suckless
+**st**. The bundled st checkout at commit
+`04ce0d6f06e6552dcbb3a1643a346f5e803cd23f` is the behavioral reference.
+Cupid keeps that terminal contract while separating terminal logic from X11
+and adding scrollback, combining-mark storage, and font fallback.
 
 ![preview](img/term.png)
 
@@ -8,9 +12,9 @@ cupidterminal is a minimalist X11 terminal emulator. It is architecturally inspi
 
 ### Architecture
 
-- **Hard module boundary.** Terminal logic lives in `cupid.c` and contains zero Xlib symbols. The X11 layer lives in `xwin.c` and talks to the parser only through the callback contract in `xwin.h`. A `make check-no-x11` build gate enforces the boundary by greeping for Xlib namespace patterns.
+- **Hard module boundary.** Terminal logic lives in `cupid.c` and contains zero Xlib symbols. The X11 layer lives in `xwin.c` and talks to the parser only through the callback contract in `xwin.h`. A `make check-no-x11` build gate enforces the boundary by checking for Xlib namespace patterns.
 - **st-compatible cell layout.** `Glyph` is exactly 16 bytes (`Rune u`, `uint16_t mode`, `uint32_t fg`, `uint32_t bg`), the same shape upstream st uses. CSI / SGR patches transfer with minimal massaging.
-- **Side-channel for combining marks.** Base codepoint lives in `Glyph.u`. Combining marks are stored sparsely on the row (`TermLine.combs`) and re-encoded at render time. This survives scroll, insert-line, and delete-line correctly because the whole `TermLine` (combs + line pointer + dirty bit) moves with the row, not just the `Glyph` array.
+- **Side-channel for combining marks.** Base codepoint lives in `Glyph.u`. Combining marks are stored sparsely on the row (`TermLine.combs`) and re-encoded at render time. Whole-line scrolling preserves the row-owned data.
 
 ### VT / ANSI
 
@@ -26,7 +30,7 @@ cupidterminal is a minimalist X11 terminal emulator. It is architecturally inspi
 - **Reverse video.** DECSCNM (`?5`) flips foreground and background screen-wide.
 - **Cursor visibility / shape.** DECTCEM (`?25`) toggles, DECSCUSR sets shape (block, underline, bar, snowman) and steady / blinking variant.
 - **Application cursor keys.** DECCKM (`?1`) switches arrow keys to SS3 sequences.
-- **Charset.** G0 / G1 selection, SO / SI shifts. DEC Special Graphics (VT100 ACS box-drawing).
+- **Charset.** G0-G3 designation, SO / SI and LS2 / LS3 shifts. DEC Special Graphics (VT100 ACS box-drawing).
 - **Device attributes / status reports.** DA (CSI c), DSR cursor position (CSI 6n), DECID.
 - **Soft / hard reset.** DECSTR (CSI ! p), RIS (ESC c).
 - **Status line.** BEL (`\a`) routes to `xbell()` for one ring per character.
@@ -48,11 +52,11 @@ cupidterminal is a minimalist X11 terminal emulator. It is architecturally inspi
 
 ### Selection and clipboard
 
-- **Selection modes.** Regular (line-aware), rectangular (`Ctrl+drag`), word-snap (double-click), line-snap (triple-click).
+- **Selection modes.** Regular (line-aware), rectangular (`Alt+drag`), word-snap (double-click), line-snap (triple-click).
 - **Public selection API.** `selstart`, `selextend`, `selclear`, `selected`, `getsel` live in `cupid.c`. The X11 layer never mutates selection state directly.
 - **X CLIPBOARD.** Copy via `Ctrl+Shift+C` and X CLIPBOARD selection.
 - **Primary selection.** Mouse-select fills primary; `Shift+Insert` or middle-click pastes from it.
-- **OSC 52 remote copy.** `\033]52;c;<base64>\007` from inside ssh, tmux, or vim writes to the local X CLIPBOARD. Implemented via base64 decoder in `cupid.c`, dispatched through `xsetsel()`.
+- **OSC 52 remote copy.** When `allowwindowops` is enabled, `\033]52;c;<base64>\007` from inside ssh, tmux, or vim writes to the local X CLIPBOARD. The st-compatible secure default leaves remote window operations disabled.
 - **Bracketed paste.** DECSET `?2004` makes pasted content arrive wrapped in `\033[200~` ... `\033[201~` so editors can disable autoindent on paste.
 
 ### Scrollback
@@ -84,7 +88,7 @@ cupidterminal is a minimalist X11 terminal emulator. It is architecturally inspi
 
 ### PTY
 
-- **Non-blocking master fd.** Read drains in a tight loop until `EAGAIN` so a single redraw frame consumes the whole burst.
+- **Non-blocking master fd.** Reads drain to `EAGAIN`; writes that hit backpressure are retained in an ordered queue and flushed when the PTY becomes writable.
 - **Echo mode.** LNM (mode 20) and SRM (mode 12) honored when set; `ttywrite(s, n, may_echo)` decides whether to also feed the bytes back to the local screen.
 - **Clean child reap.** SIGCHLD handler flags pending; reap loop drains all exited children. The terminal exits cleanly on PTY EOF.
 
@@ -108,15 +112,15 @@ sudo apt-get install libx11-dev libxft-dev libfontconfig1-dev libfreetype6-dev l
 git clone https://github.com/cupidthecat/cupidterminal.git
 cd cupidterminal
 make
+sudo make install
 ```
 
-For accurate capability reporting, install the terminfo entry and set `TERM=cupidterminal-256color` in `config.h`:
+`make install` installs the binary, manual page, and bundled terminfo entry.
+The child environment defaults to `TERM=cupidterminal-256color`.
 
 ```bash
 make install-terminfo
 ```
-
-The default `xterm-256color` works without installation.
 
 ### TUI apps (btop, etc.)
 
@@ -133,7 +137,8 @@ For btop and similar resource monitors, use a font with Braille (U+2800 to U+28F
 ./cupidterminal -c MyClass            # WM_CLASS for window managers
 ```
 
-Run `./cupidterminal` with `-h` (or invalid args) for the full flag list.
+Run `./cupidterminal` with an invalid option for the full flag list, or read
+`man cupidterminal` after installation.
 
 ## Configuration
 
@@ -146,7 +151,7 @@ make clean && make
 Key knobs in `config.h`:
 
 ```c
-static char *font     = "DejaVu Sans Mono:pixelsize=12:antialias=true:autohint=true";
+static char *font     = "Liberation Mono:pixelsize=12:antialias=true:autohint=true";
 static int   borderpx = 2;
 static unsigned int cursorshape = 2;       /* 2=block, 4=underline, 6=bar */
 static unsigned int doubleclicktimeout = 300;
@@ -172,7 +177,7 @@ Default modifier `TERMMOD = Ctrl+Shift`.
 | `Ctrl+Shift+Home` | Reset zoom |
 | `Ctrl+Shift+NumLock` | Toggle NumLock |
 | `Mouse drag` | Start selection (regular) |
-| `Ctrl+drag` | Rectangular selection |
+| `Alt+drag` | Rectangular selection |
 | `Double-click` | Word snap |
 | `Triple-click` | Line snap |
 | `Middle-click` | Paste primary selection |
@@ -187,7 +192,7 @@ Edit the `shortcuts[]` table in `src/xconfig.h` to rebind.
 | `src/cupid.h` | Public types (`Glyph`, `Line`, `Rune`, `Term`, `TermLine`, `CombMark`, `Arg`) and prototypes (`tnew`, `tresize`, `twrite`, `ttywrite`, `treset`, `tputc`, `selstart`, `selextend`, `selclear`, `selected`, `getsel`, `kscrollup_n`, `kscrolldown_n`, `term_render_cluster`, ...). |
 | `src/xwin.c` | All Xlib / Xft. Window, fonts, draw cycle, XIM, keymap dispatch, clipboard, mouse-to-selection, event loop (`run`). |
 | `src/xwin.h` | Pure callback contract `cupid.c → xwin.c` (`xbell`, `xdrawline`, `xstartdraw`, `xfinishdraw`, `xsettitle`, `xsetsel`, `xresize`, `xsetmode`, ...). |
-| `src/xentry.h` | Entry-point declarations called from `main()`: `xinit`, `run`, `parse_geometry_str`. |
+| `src/xentry.h` | Entry-point declarations called from `main()`: `xinit`, `xsync_pty_winsize`, `run`, `parse_geometry_str`. |
 | `src/xconfig.h` | X11-aware config view. Keymap tables, modifier macros. Included only by `xwin.c`. |
 | `src/config.h`, `src/config.def.h` | X11-free settings (font, colors, latency, defaults). Included by both `cupid.c` and `xconfig.h`. |
 | `src/pty.c`, `src/pty.h` | PTY spawn / read / write / reap. |
@@ -216,7 +221,8 @@ Tests use the harness in `test/common/test_common.{c,h}` and link against a `cup
 
 ## License
 
-cupidterminal is released under the **MIT License**. See `LICENSE`.
+cupidterminal and its st-derived portions are released under the
+**MIT/X Consortium License**. See `LICENSE`.
 
 ## Contributing
 
@@ -224,4 +230,6 @@ PRs welcome. Keep changes minimal and focused, run `make test` before submitting
 
 ## Acknowledgements
 
-Architecturally inspired by **suckless st**: same parser shape, same callback-contract style, same `Glyph` layout. Its own codebase, file names, and roadmap.
+Derived from **suckless st** and maintained with the bundled source as the
+runtime compatibility reference. See `docs/ST-PARITY.md` for the pinned
+revision and deliberate Cupid extensions.

@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -30,6 +31,144 @@ static PtySession g_pty_session = {
     .child_exited = 0,
     .child_status = 0,
 };
+static int printer_fd = STDOUT_FILENO;
+static int printer_fd_owned = 0;
+
+static void printer_write(const void *buf, size_t len) {
+    const unsigned char *p = buf;
+
+    while (printer_fd >= 0 && len > 0) {
+        ssize_t n = write(printer_fd, p, len);
+        if (n > 0) {
+            p += n;
+            len -= (size_t)n;
+        } else if (n < 0 && errno == EINTR) {
+            continue;
+        } else {
+            perror("cupidterminal: printer write");
+            tprinter_close();
+        }
+    }
+}
+
+static void printer_write_range(const uint8_t *bytes, size_t start, size_t end,
+                                size_t already_written) {
+    if (end <= already_written)
+        return;
+    if (start < already_written)
+        start = already_written;
+    if (end > start)
+        printer_write(bytes + start, end - start);
+}
+
+static void printer_mirror_input(const uint8_t *bytes, size_t len, int enabled,
+                                 size_t already_written) {
+    size_t pos = 0;
+
+    while (pos < len) {
+        size_t esc = pos;
+        size_t final;
+        size_t p;
+        int param = -1;
+
+        while (esc + 1 < len &&
+               !(bytes[esc] == 0x1b && bytes[esc + 1] == '['))
+            esc++;
+        if (esc + 1 >= len) {
+            if (enabled)
+                printer_write_range(bytes, pos, len, already_written);
+            return;
+        }
+
+        final = esc + 2;
+        while (final < len &&
+               !(bytes[final] >= 0x40 && bytes[final] <= 0x7e))
+            final++;
+        if (final >= len) {
+            if (enabled)
+                printer_write_range(bytes, pos, len, already_written);
+            return;
+        }
+        if (bytes[final] != 'i') {
+            final++;
+            if (enabled)
+                printer_write_range(bytes, pos, final, already_written);
+            pos = final;
+            continue;
+        }
+
+        p = esc + 2;
+        if (p < final && bytes[p] >= '0' && bytes[p] <= '9') {
+            param = 0;
+            while (p < final && bytes[p] >= '0' && bytes[p] <= '9') {
+                param = param * 10 + (bytes[p] - '0');
+                p++;
+            }
+        }
+        final++;
+        if (enabled)
+            printer_write_range(bytes, pos, final, already_written);
+        if (p == final - 1 && param == 4)
+            enabled = 0;
+        else if (p == final - 1 && param == 5)
+            enabled = 1;
+        pos = final;
+    }
+}
+
+int tprinter_open(const char *path) {
+    if (!path)
+        return 0;
+    tprinter_close();
+    if (strcmp(path, "-") == 0) {
+        printer_fd = STDOUT_FILENO;
+        printer_fd_owned = 0;
+    } else {
+        printer_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
+        printer_fd_owned = 1;
+    }
+    if (printer_fd < 0) {
+        fprintf(stderr, "cupidterminal: cannot open printer output %s: %s\n",
+                path, strerror(errno));
+        printer_fd_owned = 0;
+        return -1;
+    }
+    term.print_mode = 1;
+    return 0;
+}
+
+void tprinter_close(void) {
+    if (printer_fd_owned && printer_fd >= 0)
+        close(printer_fd);
+    printer_fd = -1;
+    printer_fd_owned = 0;
+}
+
+void tprinter_toggle(void) {
+    term.print_mode = !term.print_mode;
+}
+
+void tprinter_screen(void) {
+    for (int row = 0; row < term_rows; row++) {
+        for (int col = 0; col < term_cols; col++) {
+            char cluster[64];
+            size_t len = term_render_cluster(row, col, cluster, sizeof(cluster));
+            if (len == 0)
+                printer_write(" ", 1);
+            else
+                printer_write(cluster, len);
+        }
+        printer_write("\n", 1);
+    }
+}
+
+void tprinter_selection(void) {
+    char *selection = getsel();
+    if (selection) {
+        printer_write(selection, strlen(selection));
+        free(selection);
+    }
+}
 
 /*
  * Config globals needed by terminal body code and declared extern in config.h.
@@ -48,7 +187,7 @@ char *utmp = NULL;
 char *scroll = NULL;
 char *stty_args = "stty raw pass8 nl -echo -iexten -cstopb 38400";
 int allowaltscreen = 1;
-char *termname = "xterm-256color";
+char *termname = "cupidterminal-256color";
 unsigned int defaultfg = 258;
 unsigned int defaultbg = 259;
 unsigned int defaultcs = 256;
@@ -157,17 +296,20 @@ static void init_default_cell(Glyph *cell) {
     cell->mode = 0;
 }
 
+static void *xcalloc_or_die(size_t count, size_t size) {
+    void *ptr = calloc(count, size);
+    if (!ptr) {
+        fprintf(stderr, "cupidterminal: out of memory\n");
+        exit(EXIT_FAILURE);
+    }
+    return ptr;
+}
+
 static TermLine *alloc_term_lines(int rows, int cols) {
     if (rows <= 0 || cols <= 0) return NULL;
-    TermLine *tl = calloc((size_t)rows, sizeof(TermLine));
-    if (!tl) return NULL;
+    TermLine *tl = xcalloc_or_die((size_t)rows, sizeof(TermLine));
     for (int r = 0; r < rows; r++) {
-        tl[r].line = calloc((size_t)cols, sizeof(Glyph));
-        if (!tl[r].line) {
-            for (int rr = 0; rr < r; rr++) free(tl[rr].line);
-            free(tl);
-            return NULL;
-        }
+        tl[r].line = xcalloc_or_die((size_t)cols, sizeof(Glyph));
         for (int c = 0; c < cols; c++) {
             init_default_cell(&tl[r].line[c]);
         }
@@ -193,20 +335,10 @@ static void free_term_lines(TermLine *tl, int rows) {
 }
 
 static Glyph **alloc_history_buffer(int cols) {
-    Glyph **buffer = calloc((size_t)HISTORY_SIZE, sizeof(Glyph *));
-    if (!buffer) {
-        return NULL;
-    }
+    Glyph **buffer = xcalloc_or_die((size_t)HISTORY_SIZE, sizeof(Glyph *));
 
     for (int r = 0; r < HISTORY_SIZE; r++) {
-        buffer[r] = calloc((size_t)cols, sizeof(Glyph));
-        if (!buffer[r]) {
-            for (int rr = 0; rr < r; rr++) {
-                free(buffer[rr]);
-            }
-            free(buffer);
-            return NULL;
-        }
+        buffer[r] = xcalloc_or_die((size_t)cols, sizeof(Glyph));
         for (int c = 0; c < cols; c++) {
             init_default_cell(&buffer[r][c]);
         }
@@ -746,11 +878,19 @@ static void save_cursor_state(Term *state) {
     }
 
     cancel_pending_wrap(state);
-    state->saved_row = state->row;
-    state->saved_col = state->col;
-    state->saved_fg = state->current_fg;
-    state->saved_bg = state->current_bg;
-    state->saved_mode = state->current_mode;
+    if (state->alt_screen_active) {
+        state->alt_saved_row = state->row;
+        state->alt_saved_col = state->col;
+        state->alt_saved_fg = state->current_fg;
+        state->alt_saved_bg = state->current_bg;
+        state->alt_saved_mode = state->current_mode;
+    } else {
+        state->saved_row = state->row;
+        state->saved_col = state->col;
+        state->saved_fg = state->current_fg;
+        state->saved_bg = state->current_bg;
+        state->saved_mode = state->current_mode;
+    }
 }
 
 static void restore_cursor_state(Term *state) {
@@ -759,26 +899,26 @@ static void restore_cursor_state(Term *state) {
     }
 
     cancel_pending_wrap(state);
-    state->row = state->saved_row;
-    state->col = state->saved_col;
-    state->current_fg = state->saved_fg;
-    state->current_bg = state->saved_bg;
-    state->current_mode = state->saved_mode;
+    if (state->alt_screen_active) {
+        state->row = state->alt_saved_row;
+        state->col = state->alt_saved_col;
+        state->current_fg = state->alt_saved_fg;
+        state->current_bg = state->alt_saved_bg;
+        state->current_mode = state->alt_saved_mode;
+    } else {
+        state->row = state->saved_row;
+        state->col = state->saved_col;
+        state->current_fg = state->saved_fg;
+        state->current_bg = state->saved_bg;
+        state->current_mode = state->saved_mode;
+    }
     clamp_cursor(state);
 }
 
 static void activate_alternate_screen(Term *state) {
-    if (!state || state->alt_screen_active) {
+    if (!state || !allowaltscreen || state->alt_screen_active) {
         return;
     }
-
-    state->alt_saved_row = state->row;
-    state->alt_saved_col = state->col;
-    state->alt_saved_fg = state->current_fg;
-    state->alt_saved_bg = state->current_bg;
-    state->alt_saved_mode = state->current_mode;
-    state->alt_saved_scroll_top = state->scroll_top;
-    state->alt_saved_scroll_bottom = state->scroll_bottom;
 
     if (!alternate_term_lines) {
         alternate_term_lines = alloc_term_lines(term_rows, term_cols);
@@ -787,33 +927,22 @@ static void activate_alternate_screen(Term *state) {
         }
     }
 
-    clear_term_lines_defaults(alternate_term_lines);
     term_lines = alternate_term_lines;
     state->alt_screen_active = 1;
     mark_all_rows_dirty();
-    state->row = 0;
-    state->col = 0;
-    state->scroll_top = -1;
-    state->scroll_bottom = -1;
     state->utf8_len = 0;
     state->wrap_next = 0;
     state->scrollback_offset = 0;
 }
 
 static void deactivate_alternate_screen(Term *state) {
-    if (!state || !state->alt_screen_active) {
+    if (!state || !allowaltscreen || !state->alt_screen_active) {
         return;
     }
 
+    clear_term_lines_defaults(alternate_term_lines);
     term_lines = primary_term_lines;
     state->alt_screen_active = 0;
-    state->row = state->alt_saved_row;
-    state->col = state->alt_saved_col;
-    state->current_fg = state->alt_saved_fg;
-    state->current_bg = state->alt_saved_bg;
-    state->current_mode = state->alt_saved_mode;
-    state->scroll_top = state->alt_saved_scroll_top;
-    state->scroll_bottom = state->alt_saved_scroll_bottom;
     state->utf8_len = 0;
     state->wrap_next = 0;
     state->scrollback_offset = 0;
@@ -851,7 +980,7 @@ static int parse_csi_params(const char *body, int body_len, int *params, int max
                 }
             }
             saw_separator = 0;
-        } else if (ch == ';') {
+        } else if (ch == ';' || ch == ':') {
             if (count < max_params) {
                 params[count++] = have_digits ? value : 0;
             }
@@ -1113,11 +1242,16 @@ static void wrap_to_next_line(Term *state) {
 static void osc_reset(Term *state) {
     state->osc_active = 0;
     state->osc_esc_pending = 0;
+    state->osc_overflow = 0;
     state->osc_len = 0;
 }
 
 static void osc_append_byte(Term *state, uint8_t b) {
-    if (!state || state->osc_len >= (int)(sizeof(state->osc_buf) - 1)) {
+    if (!state) {
+        return;
+    }
+    if (state->osc_len >= (int)(sizeof(state->osc_buf) - 1)) {
+        state->osc_overflow = 1;
         return;
     }
     state->osc_buf[state->osc_len++] = (char)b;
@@ -1262,6 +1396,10 @@ static void osc_finalize(Term *state) {
     if (!state) {
         return;
     }
+    if (state->osc_overflow) {
+        osc_reset(state);
+        return;
+    }
 
     state->osc_buf[state->osc_len] = '\0';
     payload = state->osc_buf;
@@ -1375,6 +1513,11 @@ static void terminal_soft_reset(Term *state) {
     state->saved_fg = COLOR_DEFAULT_FG;
     state->saved_bg = COLOR_DEFAULT_BG;
     state->saved_mode = 0;
+    state->alt_saved_row = 0;
+    state->alt_saved_col = 0;
+    state->alt_saved_fg = COLOR_DEFAULT_FG;
+    state->alt_saved_bg = COLOR_DEFAULT_BG;
+    state->alt_saved_mode = 0;
 
     state->cursor_visible = 1;
     state->scroll_top = -1;
@@ -1383,16 +1526,23 @@ static void terminal_soft_reset(Term *state) {
     state->autowrap_mode = 1;
     state->origin_mode = 0;
     state->insert_mode = 0;
+    state->print_mode = 0;
     state->wrap_next = 0;
 
     state->mouse_reporting_basic = 0;
     state->mouse_reporting_button = 0;
     state->mouse_reporting_any = 0;
+    state->mouse_reporting_x10 = 0;
     state->mouse_sgr_mode = 0;
     state->application_cursor_keys = 0;
+    state->application_keypad = 0;
+    state->keyboard_lock = 0;
+    state->meta_eight_bit = 0;
 
     state->charset_g0 = 0;
     state->charset_g1 = 0;
+    state->charset_g2 = 0;
+    state->charset_g3 = 0;
     state->gl = 0;
 
     state->utf8_len = 0;
@@ -1469,8 +1619,8 @@ void tresize(int new_rows, int new_cols) {
     term_rows = new_rows;
     term_cols = new_cols;
 
-    new_tabs = calloc((size_t)new_cols, sizeof(unsigned char));
-    if (new_tabs) {
+    new_tabs = xcalloc_or_die((size_t)new_cols, sizeof(unsigned char));
+    {
         if (tab_stops) {
             int copy_cols = (old_cols < new_cols) ? old_cols : new_cols;
             if (copy_cols > 0) {
@@ -1484,9 +1634,6 @@ void tresize(int new_rows, int new_cols) {
             init_default_tab_stops(new_tabs, new_cols);
         }
         tab_stops = new_tabs;
-    } else if (tab_stops) {
-        free(tab_stops);
-        tab_stops = NULL;
     }
 
     if (term.alt_screen_active) {
@@ -1612,9 +1759,12 @@ static void csihandle(const char *seq, int len, Term *state,
             if (csi_has_param(param_values, param_count, 25)) {
                 state->cursor_visible = 1;
             }
-            if (csi_has_param(param_values, param_count, 47) ||
-                csi_has_param(param_values, param_count, 1047) ||
+            if (allowaltscreen &&
                 csi_has_param(param_values, param_count, 1049)) {
+                save_cursor_state(state);
+                activate_alternate_screen(state);
+            } else if (csi_has_param(param_values, param_count, 47) ||
+                       csi_has_param(param_values, param_count, 1047)) {
                 activate_alternate_screen(state);
             }
             if (csi_has_param(param_values, param_count, 1048)) {
@@ -1624,22 +1774,34 @@ static void csihandle(const char *seq, int len, Term *state,
                 state->bracketed_paste_mode = 1;
             }
             if (csi_has_param(param_values, param_count, 1000)) {
+                state->mouse_reporting_x10 = 0;
                 state->mouse_reporting_basic = 1;
                 state->mouse_reporting_button = 0;
                 state->mouse_reporting_any = 0;
             }
             if (csi_has_param(param_values, param_count, 1002)) {
+                state->mouse_reporting_x10 = 0;
                 state->mouse_reporting_basic = 0;
                 state->mouse_reporting_button = 1;
                 state->mouse_reporting_any = 0;
             }
             if (csi_has_param(param_values, param_count, 1003)) {
+                state->mouse_reporting_x10 = 0;
                 state->mouse_reporting_basic = 0;
                 state->mouse_reporting_button = 0;
                 state->mouse_reporting_any = 1;
             }
             if (csi_has_param(param_values, param_count, 1006)) {
                 state->mouse_sgr_mode = 1;
+            }
+            if (csi_has_param(param_values, param_count, 9)) {
+                state->mouse_reporting_x10 = 1;
+                state->mouse_reporting_basic = 0;
+                state->mouse_reporting_button = 0;
+                state->mouse_reporting_any = 0;
+            }
+            if (csi_has_param(param_values, param_count, 1034)) {
+                state->meta_eight_bit = 1;
             }
             if (csi_has_param(param_values, param_count, 1)) {
                 state->application_cursor_keys = 1;
@@ -1674,9 +1836,12 @@ static void csihandle(const char *seq, int len, Term *state,
             if (csi_has_param(param_values, param_count, 25)) {
                 state->cursor_visible = 0;
             }
-            if (csi_has_param(param_values, param_count, 47) ||
-                csi_has_param(param_values, param_count, 1047) ||
+            if (allowaltscreen &&
                 csi_has_param(param_values, param_count, 1049)) {
+                deactivate_alternate_screen(state);
+                restore_cursor_state(state);
+            } else if (csi_has_param(param_values, param_count, 47) ||
+                       csi_has_param(param_values, param_count, 1047)) {
                 deactivate_alternate_screen(state);
             }
             if (csi_has_param(param_values, param_count, 1048)) {
@@ -1697,6 +1862,12 @@ static void csihandle(const char *seq, int len, Term *state,
             if (csi_has_param(param_values, param_count, 1006)) {
                 state->mouse_sgr_mode = 0;
             }
+            if (csi_has_param(param_values, param_count, 9)) {
+                state->mouse_reporting_x10 = 0;
+            }
+            if (csi_has_param(param_values, param_count, 1034)) {
+                state->meta_eight_bit = 0;
+            }
             if (csi_has_param(param_values, param_count, 1)) {
                 state->application_cursor_keys = 0;
             }
@@ -1710,6 +1881,12 @@ static void csihandle(const char *seq, int len, Term *state,
                 state->focus_mode = 0;
             }
         }
+        return;
+    }
+
+    if ((cmd == 'h' || cmd == 'l') &&
+        csi_has_param(param_values, param_count, 2)) {
+        state->keyboard_lock = (cmd == 'h');
         return;
     }
 
@@ -1748,6 +1925,28 @@ static void csihandle(const char *seq, int len, Term *state,
     }
 
     switch (cmd) {
+        case 'q': {
+            int p = (param_count && param_values[0] >= 0) ? param_values[0] : 0;
+            if (p <= 7) {
+                state->cursorshape = p;
+            }
+        } break;
+
+        case 'i': {
+            int p = param_count ? param_values[0] : 0;
+            if (p == 0) tprinter_screen();
+            else if (p == 1 && state->row >= 0 && state->row < term_rows) {
+                for (int col = 0; col < term_cols; col++) {
+                    char cluster[64];
+                    size_t n = term_render_cluster(state->row, col, cluster, sizeof(cluster));
+                    printer_write(n ? cluster : " ", n ? n : 1);
+                }
+                printer_write("\n", 1);
+            } else if (p == 2) tprinter_selection();
+            else if (p == 4) state->print_mode = 0;
+            else if (p == 5) state->print_mode = 1;
+        } break;
+
         case 'H':
         case 'f': {
             int min_row = cursor_min_row(state);
@@ -2258,7 +2457,6 @@ void tputc(char c, Term *state) {
     if (!state || !term_lines || term_rows <= 0 || term_cols <= 0) {
         return;
     }
-
     if (state->row < 0) state->row = 0;
     if (state->row >= term_rows) state->row = term_rows - 1;
     if (state->col < 0) state->col = 0;
@@ -2355,18 +2553,26 @@ void tputc(char c, Term *state) {
         if (result > 0) {
             /* DEC Special Graphics (ACS): translate when active GL charset is DEC Special Graphics */
             {
-                int acs = state->gl ? state->charset_g1 : state->charset_g0;
+                int charsets[] = {
+                    state->charset_g0,
+                    state->charset_g1,
+                    state->charset_g2,
+                    state->charset_g3
+                };
+                int acs = charsets[(state->gl >= 0 && state->gl < 4) ? state->gl : 0];
                 if (acs && codepoint >= 0x41 && codepoint <= 0x7E) {
-                const char *repl = vt100_acs[codepoint - 0x41];
-                if (repl) {
-                    size_t rlen = strlen(repl);
-                    if (rlen > 0 && rlen < (size_t)sizeof(state->utf8_buf)) {
-                        memcpy(state->utf8_buf, repl, rlen + 1);
-                        state->utf8_len = (int)rlen;
-                        result = utf8proc_iterate(state->utf8_buf, state->utf8_len, &codepoint);
+                    const char *repl = vt100_acs[codepoint - 0x41];
+                    if (repl) {
+                        size_t rlen = strlen(repl);
+                        if (rlen > 0 && rlen < (size_t)sizeof(state->utf8_buf)) {
+                            memcpy(state->utf8_buf, repl, rlen + 1);
+                            state->utf8_len = (int)rlen;
+                            if (utf8proc_iterate(state->utf8_buf,
+                                    state->utf8_len, &codepoint) <= 0)
+                                codepoint = '?';
+                        }
                     }
                 }
-            }
             }
 
             int width = wcwidth((wchar_t)codepoint);
@@ -2499,6 +2705,8 @@ void tputc(char c, Term *state) {
 
 void twrite(const uint8_t *bytes, size_t len, Term *state,
     terminal_response_fn response_fn, void *response_ctx) {
+    size_t pending_before;
+
     if (!bytes || !state) {
         return;
     }
@@ -2507,6 +2715,7 @@ void twrite(const uint8_t *bytes, size_t len, Term *state,
     uint8_t combined_buf[COMBINED_MAX];
     const uint8_t *buf = bytes;
     size_t buflen = len;
+    pending_before = (size_t)state->csi_pending_len;
     if (state->csi_pending_len > 0) {
         size_t total = (size_t)state->csi_pending_len + len;
         if (total > COMBINED_MAX) total = COMBINED_MAX;
@@ -2517,6 +2726,8 @@ void twrite(const uint8_t *bytes, size_t len, Term *state,
         state->csi_pending_len = 0;
     }
     if (buflen == 0) return;
+    printer_mirror_input(buf, buflen, state->print_mode,
+                         state->print_mode ? pending_before : 0);
 
     size_t i = 0;
     while (i < buflen) {
@@ -2641,28 +2852,33 @@ void twrite(const uint8_t *bytes, size_t len, Term *state,
                 break;
             }
 
-            /* ESC ( X or ESC ) X - G0/G1 charset designation (DEC Special Graphics) */
-            if ((buf[i] == '(' || buf[i] == ')') && i + 1 < buflen) {
-                int g = (buf[i] == '(') ? 0 : 1;
+            /* ESC followed by (, ), *, or + designates G0 through G3. */
+            if ((buf[i] == '(' || buf[i] == ')' || buf[i] == '*' || buf[i] == '+') &&
+                i + 1 < buflen) {
+                int g = (int)buf[i] - (int)'(';
                 uint8_t x = buf[i + 1];
+                int value = (x == '0') ? 1 : 0;
                 if (x == '0') {
-                    if (g) state->charset_g1 = 1; else state->charset_g0 = 1;
+                    if (g == 0) state->charset_g0 = value;
+                    else if (g == 1) state->charset_g1 = value;
+                    else if (g == 2) state->charset_g2 = value;
+                    else state->charset_g3 = value;
                 } else if (x == 'B') {
-                    if (g) state->charset_g1 = 0; else state->charset_g0 = 0;
+                    if (g == 0) state->charset_g0 = value;
+                    else if (g == 1) state->charset_g1 = value;
+                    else if (g == 2) state->charset_g2 = value;
+                    else state->charset_g3 = value;
                 }
                 i += 2;
                 continue;
             }
-            /*
-             * ESC n/o are ISO-2022 LS2/LS3 (select G2/G3 into GL).
-             * We currently implement only G0/G1, so treat these as no-ops.
-             * Forcing GL to G1 here can leak ACS into normal text and corrupt TUIs.
-             */
             if (buf[i] == 'n' || buf[i] == 'o') {
+                state->gl = 2 + (buf[i] - 'n');
                 i++;
                 continue;
             }
-            if ((buf[i] == '(' || buf[i] == ')') && i + 1 >= buflen) {
+            if ((buf[i] == '(' || buf[i] == ')' || buf[i] == '*' || buf[i] == '+') &&
+                i + 1 >= buflen) {
                 size_t tail = buflen - start;
                 if (tail > 0 && tail <= CSI_PENDING_MAX) {
                     memcpy(state->csi_pending, buf + start, tail);
@@ -2700,6 +2916,7 @@ void twrite(const uint8_t *bytes, size_t len, Term *state,
                 i++;
                 state->osc_active = 1;
                 state->osc_esc_pending = 0;
+                state->osc_overflow = 0;
                 state->osc_len = 0;
                 continue;
             }
@@ -2715,8 +2932,34 @@ void twrite(const uint8_t *bytes, size_t len, Term *state,
              * Must be consumed here; without this the '=' or '>' byte falls
              * through to tputc() and is printed literally in the prompt. */
             if (buf[i] == '=' || buf[i] == '>') {
+                state->application_keypad = (buf[i] == '=');
                 i++;
                 continue;
+            }
+
+            if (buf[i] == '#' && i + 1 < buflen) {
+                if (buf[i + 1] == '8') {
+                    for (int row = 0; row < term_rows; row++) {
+                        for (int col = 0; col < term_cols; col++) {
+                            clear_cell(&term_lines[row].line[col], state);
+                            term_lines[row].line[col].u = 'E';
+                            term_lines[row].line[col].fg = state->current_fg;
+                            term_lines[row].line[col].bg = state->current_bg;
+                            term_lines[row].line[col].mode = state->current_mode;
+                        }
+                        mark_row_dirty(row);
+                    }
+                }
+                i += 2;
+                continue;
+            }
+            if (buf[i] == '#' && i + 1 >= buflen) {
+                size_t tail = buflen - start;
+                if (tail > 0 && tail <= CSI_PENDING_MAX) {
+                    memcpy(state->csi_pending, buf + start, tail);
+                    state->csi_pending_len = (int)tail;
+                }
+                break;
             }
 
             /* Unknown ESC X: consume the second byte as a no-op so it is not
@@ -3049,13 +3292,8 @@ void ttywrite(const char *s, size_t n, int may_echo) {
     }
 
     if (g_pty_session.master_fd >= 0) {
-        size_t sent = 0;
-        while (sent < to_len) {
-            ssize_t rc = write(g_pty_session.master_fd, to_write + sent, to_len - sent);
-            if (rc > 0)                      { sent += (size_t)rc; continue; }
-            if (rc < 0 && errno == EINTR)    continue;
-            break;
-        }
+        if (pty_session_write(&g_pty_session, to_write, to_len) < 0)
+            perror("write error on tty");
     }
 }
 
@@ -3113,15 +3351,23 @@ run:
     if (argc > 0) opt_cmd = argv;
     if (cols < 1) cols = 1;
     if (rows < 1) rows = 1;
+    if (!opt_title)
+        opt_title = (opt_line || !opt_cmd) ? "cupidterminal" : opt_cmd[0];
 
     pty_install_signal_handlers();
+
+    xinit((int)cols, (int)rows, &g_pty_session);
+
+    if (tprinter_open(opt_io) == -1)
+        return EXIT_FAILURE;
 
     if (pty_session_spawn(&g_pty_session, opt_line, SHELL, opt_cmd, TERM) == -1)
         return EXIT_FAILURE;
 
-    xinit((int)cols, (int)rows, &g_pty_session);
+    xsync_pty_winsize(&g_pty_session);
     run();
 
+    tprinter_close();
     return 0;
 }
 #endif /* !CUPID_NO_MAIN */
