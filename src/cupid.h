@@ -17,6 +17,8 @@ extern int term_cols;
 #define MAX_CHARS 4096
 
 #define MAX_UTF8_CHAR_SIZE 32  // buffer size for last-printed codepoint scratch (CSI REP)
+#define MAX_COMBINING_MARKS 128
+#define MAX_CLUSTER_UTF8 (((MAX_COMBINING_MARKS + 1) * 4) + 1)
 
 #define ATTR_BOLD       (1 << 0)
 #define ATTR_FAINT      (1 << 1)
@@ -73,6 +75,7 @@ void term_append_comb(int row, int col, Rune cp);
    NUL-terminated UTF-8.  Returns bytes written (NOT counting NUL),
    0 on empty / error. */
 size_t term_render_cluster(int row, int col, char *out, size_t cap);
+size_t term_render_visual_cluster(int row, int col, char *out, size_t cap);
 
 /* Callback for DSR/DA responses: terminal writes bytes back to host */
 typedef void (*terminal_response_fn)(const uint8_t *bytes, size_t len, void *ctx);
@@ -143,6 +146,7 @@ typedef struct {
     int sel_row, sel_col;               // current drag end
     int sel_type;   /* 0=SEL_REGULAR, 1=SEL_RECTANGULAR */
     int sel_snap;   /* 0=none, 1=SNAP_WORD, 2=SNAP_LINE */
+    int sel_alt_screen;
 
     /* Last printed character for REP (CSI b) */
     char lastc[MAX_UTF8_CHAR_SIZE + 1];

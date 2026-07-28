@@ -151,7 +151,7 @@ void tprinter_toggle(void) {
 void tprinter_screen(void) {
     for (int row = 0; row < term_rows; row++) {
         for (int col = 0; col < term_cols; col++) {
-            char cluster[64];
+            char cluster[MAX_CLUSTER_UTF8];
             size_t len = term_render_cluster(row, col, cluster, sizeof(cluster));
             if (len == 0)
                 printer_write(" ", 1);
@@ -238,7 +238,7 @@ static TermLine *alternate_term_lines = NULL;
 static unsigned char *tab_stops = NULL;
 
 #define HISTORY_SIZE 2000
-static Glyph **history_buffer = NULL;
+static TermLine *history_lines = NULL;
 static int history_head = 0;   /* next insertion slot */
 static int history_count = 0;  /* number of valid rows in history */
 
@@ -334,64 +334,84 @@ static void free_term_lines(TermLine *tl, int rows) {
     free(tl);
 }
 
-static Glyph **alloc_history_buffer(int cols) {
-    Glyph **buffer = xcalloc_or_die((size_t)HISTORY_SIZE, sizeof(Glyph *));
-
-    for (int r = 0; r < HISTORY_SIZE; r++) {
-        buffer[r] = xcalloc_or_die((size_t)cols, sizeof(Glyph));
-        for (int c = 0; c < cols; c++) {
-            init_default_cell(&buffer[r][c]);
-        }
-    }
-
-    return buffer;
+static void free_line_combs(TermLine *line) {
+    if (!line) return;
+    for (uint16_t i = 0; i < line->ncombs; i++)
+        free(line->combs[i].runes);
+    free(line->combs);
+    line->combs = NULL;
+    line->ncombs = 0;
+    line->combs_cap = 0;
 }
 
-static void free_history_buffer(Glyph **buffer) {
-    if (!buffer) {
+static CombMark *find_line_comb(TermLine *line, int col) {
+    if (!line) return NULL;
+    for (uint16_t i = 0; i < line->ncombs; i++)
+        if (line->combs[i].col == col)
+            return &line->combs[i];
+    return NULL;
+}
+
+static void copy_line_contents(TermLine *dst, const TermLine *src,
+                               int copy_cols) {
+    if (!dst || !src || !dst->line || !src->line || copy_cols <= 0)
         return;
-    }
-    for (int r = 0; r < HISTORY_SIZE; r++) {
-        free(buffer[r]);
-    }
-    free(buffer);
-}
 
-static Glyph **resize_history_buffer(Glyph **old_buffer, int old_cols, int new_cols) {
-    Glyph **new_buffer = alloc_history_buffer(new_cols);
+    free_line_combs(dst);
+    memcpy(dst->line, src->line, (size_t)copy_cols * sizeof(Glyph));
+    for (int col = 0; col < copy_cols; col++)
+        dst->line[col].mode &= ~ATTR_HASCOMB;
 
-    if (!new_buffer) {
-        return NULL;
-    }
+    for (uint16_t i = 0; i < src->ncombs; i++) {
+        const CombMark *source = &src->combs[i];
+        CombMark *target;
 
-    if (old_buffer && old_cols > 0) {
-        int copy_cols = (old_cols < new_cols) ? old_cols : new_cols;
-        if (copy_cols > 0) {
-            for (int r = 0; r < HISTORY_SIZE; r++) {
-                memcpy(new_buffer[r], old_buffer[r], (size_t)copy_cols * sizeof(Glyph));
+        if (source->col < 0 || source->col >= copy_cols || source->n == 0)
+            continue;
+        if (dst->ncombs == dst->combs_cap) {
+            uint16_t cap = dst->combs_cap ? (uint16_t)(dst->combs_cap * 2) : 4;
+            CombMark *grown = realloc(dst->combs, (size_t)cap * sizeof(*grown));
+            if (!grown) {
+                fprintf(stderr, "cupidterminal: out of memory\n");
+                exit(EXIT_FAILURE);
             }
+            dst->combs = grown;
+            dst->combs_cap = cap;
         }
-        free_history_buffer(old_buffer);
-    }
-
-    return new_buffer;
-}
-
-static void __attribute__((unused)) clear_history_row(int slot) {
-    if (!history_buffer || slot < 0 || slot >= HISTORY_SIZE || term_cols <= 0) {
-        return;
-    }
-    for (int c = 0; c < term_cols; c++) {
-        init_default_cell(&history_buffer[slot][c]);
+        target = &dst->combs[dst->ncombs++];
+        target->col = source->col;
+        target->n = source->n;
+        target->cap = source->n;
+        target->runes = xcalloc_or_die(source->n, sizeof(*target->runes));
+        memcpy(target->runes, source->runes,
+               (size_t)source->n * sizeof(*target->runes));
+        dst->line[target->col].mode |= ATTR_HASCOMB;
     }
 }
 
-static void push_history_line(const Glyph *row, Term *state) {
-    if (!history_buffer || !row || !state || state->alt_screen_active || term_cols <= 0) {
+static TermLine *alloc_history_lines(int cols) {
+    return alloc_term_lines(HISTORY_SIZE, cols);
+}
+
+static TermLine *resize_history_lines(TermLine *old_lines, int old_cols,
+                                      int new_cols) {
+    TermLine *new_lines = alloc_history_lines(new_cols);
+    int copy_cols = old_cols < new_cols ? old_cols : new_cols;
+
+    if (old_lines && copy_cols > 0)
+        for (int r = 0; r < HISTORY_SIZE; r++)
+            copy_line_contents(&new_lines[r], &old_lines[r], copy_cols);
+    free_term_lines(old_lines, HISTORY_SIZE);
+    return new_lines;
+}
+
+static void push_history_line(const TermLine *row, Term *state) {
+    if (!history_lines || !row || !state || state->alt_screen_active ||
+        term_cols <= 0) {
         return;
     }
 
-    memcpy(history_buffer[history_head], row, (size_t)term_cols * sizeof(Glyph));
+    copy_line_contents(&history_lines[history_head], row, term_cols);
     history_head = (history_head + 1) % HISTORY_SIZE;
     if (history_count < HISTORY_SIZE) {
         history_count++;
@@ -406,20 +426,21 @@ static void push_history_line(const Glyph *row, Term *state) {
     }
 }
 
-static const Glyph *history_row_by_relative_index(int rel) {
+static TermLine *history_row_by_relative_index(int rel) {
     int oldest;
     int slot;
 
-    if (!history_buffer || rel < 0 || rel >= history_count) {
+    if (!history_lines || rel < 0 || rel >= history_count) {
         return NULL;
     }
 
     oldest = (history_head - history_count + HISTORY_SIZE) % HISTORY_SIZE;
     slot = (oldest + rel) % HISTORY_SIZE;
-    return history_buffer[slot];
+    return &history_lines[slot];
 }
 
-static TermLine *resize_term_lines(TermLine *old_tl, int old_rows, int old_cols, int new_rows, int new_cols) {
+static TermLine *resize_term_lines(TermLine *old_tl, int old_rows, int old_cols,
+                                   int new_rows, int new_cols, int row_shift) {
     TermLine *new_tl = alloc_term_lines(new_rows, new_cols);
 
     if (!new_tl) {
@@ -427,11 +448,12 @@ static TermLine *resize_term_lines(TermLine *old_tl, int old_rows, int old_cols,
     }
 
     if (old_tl) {
-        int copy_rows = (old_rows < new_rows) ? old_rows : new_rows;
+        int available_rows = old_rows - row_shift;
+        int copy_rows = (available_rows < new_rows) ? available_rows : new_rows;
         int copy_cols = (old_cols < new_cols) ? old_cols : new_cols;
         for (int r = 0; r < copy_rows; r++) {
-            if (old_tl[r].line && new_tl[r].line)
-                memcpy(new_tl[r].line, old_tl[r].line, (size_t)copy_cols * sizeof(Glyph));
+            if (old_tl[r + row_shift].line && new_tl[r].line)
+                copy_line_contents(&new_tl[r], &old_tl[r + row_shift], copy_cols);
         }
         free_term_lines(old_tl, old_rows);
     }
@@ -443,6 +465,7 @@ static void clear_term_lines_defaults(TermLine *tl) {
     if (!tl) return;
     for (int r = 0; r < term_rows; r++) {
         if (!tl[r].line) continue;
+        free_line_combs(&tl[r]);
         for (int c = 0; c < term_cols; c++) {
             init_default_cell(&tl[r].line[c]);
         }
@@ -460,6 +483,75 @@ static void clear_cell(Glyph *cell, const Term *state) {
     cell->mode = state->current_mode & ~(ATTR_WIDE | ATTR_WDUMMY);
 }
 
+static void remove_line_comb(TermLine *line, int col) {
+    if (!line) return;
+    for (uint16_t i = 0; i < line->ncombs; i++) {
+        if (line->combs[i].col != col)
+            continue;
+        free(line->combs[i].runes);
+        if (i + 1 < line->ncombs)
+            memmove(&line->combs[i], &line->combs[i + 1],
+                    (size_t)(line->ncombs - i - 1) * sizeof(*line->combs));
+        line->ncombs--;
+        break;
+    }
+    if (line->line && col >= 0 && col < term_cols)
+        line->line[col].mode &= ~ATTR_HASCOMB;
+}
+
+static void clear_cell_at(TermLine *line, int col, const Term *state) {
+    if (!line || !line->line || col < 0 || col >= term_cols)
+        return;
+    remove_line_comb(line, col);
+    clear_cell(&line->line[col], state);
+}
+
+static void shift_line_right(TermLine *line, int from, int shift,
+                             const Term *state) {
+    if (!line || !line->line || shift <= 0 || from < 0 || from >= term_cols)
+        return;
+    if (shift > term_cols - from)
+        shift = term_cols - from;
+
+    for (uint16_t i = 0; i < line->ncombs;) {
+        int col = line->combs[i].col;
+        if (col >= term_cols - shift) {
+            remove_line_comb(line, col);
+            continue;
+        }
+        if (col >= from)
+            line->combs[i].col += shift;
+        i++;
+    }
+    memmove(&line->line[from + shift], &line->line[from],
+            (size_t)(term_cols - from - shift) * sizeof(Glyph));
+    for (int col = from; col < from + shift; col++)
+        clear_cell_at(line, col, state);
+}
+
+static void shift_line_left(TermLine *line, int from, int shift,
+                            const Term *state) {
+    if (!line || !line->line || shift <= 0 || from < 0 || from >= term_cols)
+        return;
+    if (shift > term_cols - from)
+        shift = term_cols - from;
+
+    for (uint16_t i = 0; i < line->ncombs;) {
+        int col = line->combs[i].col;
+        if (col >= from && col < from + shift) {
+            remove_line_comb(line, col);
+            continue;
+        }
+        if (col >= from + shift)
+            line->combs[i].col -= shift;
+        i++;
+    }
+    memmove(&line->line[from], &line->line[from + shift],
+            (size_t)(term_cols - from - shift) * sizeof(Glyph));
+    for (int col = term_cols - shift; col < term_cols; col++)
+        clear_cell_at(line, col, state);
+}
+
 /*
  * free_row_combs: release all combining-mark data owned by term_lines[row].
  * After this call combs/ncombs/combs_cap are zeroed; the .line pointer and
@@ -467,14 +559,7 @@ static void clear_cell(Glyph *cell, const Term *state) {
  */
 static void free_row_combs(int row) {
     TermLine *tl = &term_lines[row];
-    if (tl->combs) {
-        for (uint16_t i = 0; i < tl->ncombs; i++)
-            free(tl->combs[i].runes);
-        free(tl->combs);
-        tl->combs = NULL;
-    }
-    tl->ncombs = 0;
-    tl->combs_cap = 0;
+    free_line_combs(tl);
 }
 
 static int scroll_region_top(const Term *state) {
@@ -592,7 +677,7 @@ int tgetscrolloffset(void) {
     return term.scrollback_offset;
 }
 
-const Glyph *tgetline(int visual_row) {
+static TermLine *resolve_visual_line(int visual_row) {
     int offset = term.scrollback_offset;
     int live_row;
     int rel;
@@ -602,7 +687,7 @@ const Glyph *tgetline(int visual_row) {
     }
 
     if (term.alt_screen_active || offset <= 0) {
-        return term_lines[visual_row].line;
+        return &term_lines[visual_row];
     }
 
     if (offset > history_count) {
@@ -618,7 +703,12 @@ const Glyph *tgetline(int visual_row) {
     if (live_row < 0 || live_row >= term_rows) {
         return NULL;
     }
-    return term_lines[live_row].line;
+    return &term_lines[live_row];
+}
+
+const Glyph *tgetline(int visual_row) {
+    TermLine *line = resolve_visual_line(visual_row);
+    return line ? line->line : NULL;
 }
 
 static void clear_row_range(int row, int start_col, int end_col, const Term *state) {
@@ -644,7 +734,7 @@ static void clear_row_range(int row, int start_col, int end_col, const Term *sta
     }
 
     for (int c = start_col; c <= end_col; c++) {
-        clear_cell(&term_lines[row].line[c], state);
+        clear_cell_at(&term_lines[row], c, state);
     }
     mark_row_dirty(row);
 }
@@ -714,7 +804,7 @@ static void scroll_up_one_line(Term *state) {
     }
 
     if (!state->alt_screen_active && top == 0 && bottom == term_rows - 1) {
-        push_history_line(term_lines[top].line, state);
+        push_history_line(&term_lines[top], state);
     }
 
     selscroll_adjust(state, top, 1);
@@ -1079,12 +1169,7 @@ void term_append_comb(int row, int col, Rune cp) {
     if (!tl->line) return;
 
     /* Find or create CombMark for this column. */
-    for (uint16_t i = 0; i < tl->ncombs; i++) {
-        if (tl->combs[i].col == col) {
-            cm = &tl->combs[i];
-            break;
-        }
-    }
+    cm = find_line_comb(tl, col);
     if (!cm) {
         if (tl->ncombs == tl->combs_cap) {
             uint16_t new_cap = tl->combs_cap ? (uint16_t)(tl->combs_cap * 2) : 4;
@@ -1099,9 +1184,14 @@ void term_append_comb(int row, int col, Rune cp) {
         cm->cap = 0;
         cm->runes = NULL;
     }
+    if (cm->n >= MAX_COMBINING_MARKS)
+        return;
     if (cm->n == cm->cap) {
-        uint8_t new_rcap = cm->cap ? (uint8_t)(cm->cap * 2) : 2;
-        if (new_rcap <= cm->cap) return;  /* overflow guard */
+        unsigned int grown_cap = cm->cap ? (unsigned int)cm->cap * 2u : 2u;
+        uint8_t new_rcap;
+        if (grown_cap > MAX_COMBINING_MARKS)
+            grown_cap = MAX_COMBINING_MARKS;
+        new_rcap = (uint8_t)grown_cap;
         Rune *grown = realloc(cm->runes, (size_t)new_rcap * sizeof(*cm->runes));
         if (!grown) return;
         cm->runes = grown;
@@ -1115,14 +1205,17 @@ void term_append_comb(int row, int col, Rune cp) {
 /* Phase 3.6: Encode the cluster anchored at (row,col) — base Rune plus any
    combining marks from the row's side-channel — into out/cap as NUL-terminated
    UTF-8.  Returns bytes written (NOT counting NUL), 0 on empty / error. */
-size_t term_render_cluster(int row, int col, char *out, size_t cap) {
-    if (!term_lines || !out || cap == 0 ||
-        row < 0 || row >= term_rows || col < 0 || col >= term_cols) {
+static size_t render_line_cluster(const TermLine *line, int col,
+                                  char *out, size_t cap) {
+    const Glyph *g;
+    size_t n = 0;
+
+    if (!line || !line->line || !out || cap == 0 ||
+        col < 0 || col >= term_cols) {
         if (out && cap) out[0] = '\0';
         return 0;
     }
-    Glyph *g = &term_lines[row].line[col];
-    size_t n = 0;
+    g = &line->line[col];
 
     if (g->u != 0) {
         utf8proc_uint8_t buf[4];
@@ -1133,10 +1226,12 @@ size_t term_render_cluster(int row, int col, char *out, size_t cap) {
     }
 
     if (g->mode & ATTR_HASCOMB) {
-        TermLine *tl = &term_lines[row];
-        CombMark *cm = NULL;
-        for (uint16_t i = 0; i < tl->ncombs; i++) {
-            if (tl->combs[i].col == col) { cm = &tl->combs[i]; break; }
+        const CombMark *cm = NULL;
+        for (uint16_t i = 0; i < line->ncombs; i++) {
+            if (line->combs[i].col == col) {
+                cm = &line->combs[i];
+                break;
+            }
         }
         if (cm) {
             for (uint8_t i = 0; i < cm->n; i++) {
@@ -1150,6 +1245,18 @@ size_t term_render_cluster(int row, int col, char *out, size_t cap) {
     }
     out[n] = '\0';
     return n;
+}
+
+size_t term_render_cluster(int row, int col, char *out, size_t cap) {
+    if (!term_lines || row < 0 || row >= term_rows) {
+        if (out && cap) out[0] = '\0';
+        return 0;
+    }
+    return render_line_cluster(&term_lines[row], col, out, cap);
+}
+
+size_t term_render_visual_cluster(int row, int col, char *out, size_t cap) {
+    return render_line_cluster(resolve_visual_line(row), col, out, cap);
 }
 
 static int append_combining_mark(int row, int col, const uint8_t *bytes, int byte_len) {
@@ -1188,17 +1295,19 @@ static void normalize_cell_for_write(int row, int col, const Term *state) {
 
     if (term_lines[row].line[col].mode & ATTR_WDUMMY) {
         if (col > 0 && (term_lines[row].line[col - 1].mode & ATTR_WIDE)) {
-            clear_cell(&term_lines[row].line[col - 1], state);
+            clear_cell_at(&term_lines[row], col - 1, state);
         }
-        clear_cell(&term_lines[row].line[col], state);
+        clear_cell_at(&term_lines[row], col, state);
     }
 
     if (term_lines[row].line[col].mode & ATTR_WIDE) {
         if (col + 1 < term_cols && (term_lines[row].line[col + 1].mode & ATTR_WDUMMY)) {
-            clear_cell(&term_lines[row].line[col + 1], state);
+            clear_cell_at(&term_lines[row], col + 1, state);
         }
-        clear_cell(&term_lines[row].line[col], state);
+        clear_cell_at(&term_lines[row], col, state);
     }
+
+    remove_line_comb(&term_lines[row], col);
 }
 
 static void advance_row_with_scroll(Term *state) {
@@ -1561,28 +1670,33 @@ static void terminal_soft_reset(Term *state) {
 }
 
 void tresize(int new_rows, int new_cols) {
-    Glyph **new_history = NULL;
+    TermLine *new_history = NULL;
     TermLine *new_primary_tl;
     TermLine *new_alt_tl = NULL;
     unsigned char *new_tabs = NULL;
     int old_rows = term_rows;
     int old_cols = term_cols;
+    int row_shift = 0;
 
     if (new_rows <= 0) new_rows = 1;
     if (new_cols <= 0) new_cols = 1;
+    if (new_rows < old_rows && term.row >= new_rows)
+        row_shift = term.row - new_rows + 1;
 
     if (primary_term_lines != NULL && new_rows == term_rows && new_cols == term_cols) {
         term_lines = (term.alt_screen_active && alternate_term_lines) ? alternate_term_lines : primary_term_lines;
         return;
     }
 
-    new_primary_tl = resize_term_lines(primary_term_lines, old_rows, old_cols, new_rows, new_cols);
+    new_primary_tl = resize_term_lines(primary_term_lines, old_rows, old_cols,
+                                       new_rows, new_cols, row_shift);
     if (!new_primary_tl) {
         return;
     }
 
     if (alternate_term_lines) {
-        new_alt_tl = resize_term_lines(alternate_term_lines, old_rows, old_cols, new_rows, new_cols);
+        new_alt_tl = resize_term_lines(alternate_term_lines, old_rows, old_cols,
+                                       new_rows, new_cols, row_shift);
         if (!new_alt_tl) {
             primary_term_lines = new_primary_tl;
             alternate_term_lines = NULL;
@@ -1595,16 +1709,10 @@ void tresize(int new_rows, int new_cols) {
         }
     }
 
-    if (history_buffer) {
-        new_history = resize_history_buffer(history_buffer, old_cols, new_cols);
-        if (!new_history) {
-            free_history_buffer(history_buffer);
-            history_buffer = NULL;
-            history_count = 0;
-            history_head = 0;
-        }
+    if (history_lines) {
+        new_history = resize_history_lines(history_lines, old_cols, new_cols);
     } else {
-        new_history = alloc_history_buffer(new_cols);
+        new_history = alloc_history_lines(new_cols);
         if (new_history) {
             history_count = 0;
             history_head = 0;
@@ -1614,7 +1722,7 @@ void tresize(int new_rows, int new_cols) {
     primary_term_lines = new_primary_tl;
     alternate_term_lines = new_alt_tl;
     if (new_history) {
-        history_buffer = new_history;
+        history_lines = new_history;
     }
     term_rows = new_rows;
     term_cols = new_cols;
@@ -1680,9 +1788,9 @@ void tnew(Term *state) {
         free(tab_stops);
         tab_stops = NULL;
     }
-    if (history_buffer) {
-        free_history_buffer(history_buffer);
-        history_buffer = NULL;
+    if (history_lines) {
+        free_term_lines(history_lines, HISTORY_SIZE);
+        history_lines = NULL;
     }
     history_count = 0;
     history_head = 0;
@@ -1937,7 +2045,7 @@ static void csihandle(const char *seq, int len, Term *state,
             if (p == 0) tprinter_screen();
             else if (p == 1 && state->row >= 0 && state->row < term_rows) {
                 for (int col = 0; col < term_cols; col++) {
-                    char cluster[64];
+                    char cluster[MAX_CLUSTER_UTF8];
                     size_t n = term_render_cluster(state->row, col, cluster, sizeof(cluster));
                     printer_write(n ? cluster : " ", n ? n : 1);
                 }
@@ -2268,12 +2376,7 @@ static void csihandle(const char *seq, int len, Term *state,
             if (from < 0) from = 0;
             shift = (from + n < term_cols) ? n : (term_cols - from);
             if (shift <= 0) break;
-            for (int c = term_cols - 1; c >= from + shift; c--) {
-                term_lines[state->row].line[c] = term_lines[state->row].line[c - shift];
-            }
-            for (int c = from; c < from + shift && c < term_cols; c++) {
-                clear_cell(&term_lines[state->row].line[c], state);
-            }
+            shift_line_right(&term_lines[state->row], from, shift, state);
             mark_row_dirty(state->row);
         } break;
 
@@ -2288,12 +2391,7 @@ static void csihandle(const char *seq, int len, Term *state,
             if (from < 0) from = 0;
             shift = (from + n < term_cols) ? n : (term_cols - from);
             if (shift <= 0) break;
-            for (int c = from; c < term_cols - shift; c++) {
-                term_lines[state->row].line[c] = term_lines[state->row].line[c + shift];
-            }
-            for (int c = term_cols - shift; c < term_cols; c++) {
-                clear_cell(&term_lines[state->row].line[c], state);
-            }
+            shift_line_left(&term_lines[state->row], from, shift, state);
             mark_row_dirty(state->row);
         } break;
 
@@ -2613,10 +2711,7 @@ void tputc(char c, Term *state) {
                         state->wrap_next = 0;
                         state->col = term_cols - 1;
                     } else {
-                        state->wrap_next = 0;
-                        state->wrap_overwrite_next = 0;
-                        state->col = 0;
-                        advance_row_with_scroll(state);
+                        wrap_to_next_line(state);
                     }
                 } else {
                     state->wrap_next = 0;
@@ -2647,14 +2742,7 @@ void tputc(char c, Term *state) {
 
             if (state->insert_mode) {
                 int shift = width;
-                if (col + shift < term_cols) {
-                    for (int cc = term_cols - 1; cc >= col + shift; cc--) {
-                        term_lines[row].line[cc] = term_lines[row].line[cc - shift];
-                    }
-                }
-                for (int cc = col; cc < col + shift && cc < term_cols; cc++) {
-                    clear_cell(&term_lines[row].line[cc], state);
-                }
+                shift_line_right(&term_lines[row], col, shift, state);
             }
 
             normalize_cell_for_write(row, col, state);
@@ -2679,7 +2767,7 @@ void tputc(char c, Term *state) {
 
             if (width == 2 && col + 1 < term_cols) {
                 normalize_cell_for_write(row, col + 1, state);
-                clear_cell(&term_lines[row].line[col + 1], state);
+                clear_cell_at(&term_lines[row], col + 1, state);
                 term_lines[row].line[col + 1].mode = (term_lines[row].line[col + 1].mode & ~(ATTR_WIDE | ATTR_WDUMMY)) | ATTR_WDUMMY;
             }
 
@@ -2941,7 +3029,7 @@ void twrite(const uint8_t *bytes, size_t len, Term *state,
                 if (buf[i + 1] == '8') {
                     for (int row = 0; row < term_rows; row++) {
                         for (int col = 0; col < term_cols; col++) {
-                            clear_cell(&term_lines[row].line[col], state);
+                            clear_cell_at(&term_lines[row], col, state);
                             term_lines[row].line[col].u = 'E';
                             term_lines[row].line[col].fg = state->current_fg;
                             term_lines[row].line[col].bg = state->current_bg;
@@ -3126,14 +3214,27 @@ size_t tpastefmt(const uint8_t *input, size_t input_len, int bracketed_mode,
 /* Selection API — all selection state lives in Term; x.c calls these.      */
 /* ======================================================================== */
 
+static int visual_line_length(int row) {
+    const Glyph *line = tgetline(row);
+    int len = term_cols;
+
+    if (!line || term_cols <= 0)
+        return 0;
+    if (line[term_cols - 1].mode & ATTR_WRAP)
+        return term_cols;
+    while (len > 0 && (line[len - 1].u == 0 || line[len - 1].u == ' '))
+        len--;
+    return len;
+}
+
 /* Returns 1 if (row,col) cluster text is a word-delimiter. */
 static int sel_cell_is_delim(int row, int col) {
-    char cluster[64];
+    char cluster[MAX_CLUSTER_UTF8];
     utf8proc_int32_t cp;
     utf8proc_ssize_t n;
     size_t clen;
     if (row < 0 || row >= term_rows || col < 0 || col >= term_cols) return 1;
-    clen = term_render_cluster(row, col, cluster, sizeof cluster);
+    clen = term_render_visual_cluster(row, col, cluster, sizeof cluster);
     if (clen == 0) return 1;
     n = utf8proc_iterate((const utf8proc_uint8_t *)cluster, (utf8proc_ssize_t)clen, &cp);
     if (n <= 0) return 1;
@@ -3142,8 +3243,14 @@ static int sel_cell_is_delim(int row, int col) {
 
 static void selsnap_st(int *x, int *y, int direction) {
     int newx, newy, prevdelim, delim;
+    const Glyph *line;
+    Rune previous;
+
     switch (term.sel_snap) {
     case SNAP_WORD:
+        line = tgetline(*y);
+        if (!line) break;
+        previous = line[*x].u;
         prevdelim = sel_cell_is_delim(*y, *x);
         for (;;) {
             newx = *x + direction; newy = *y;
@@ -3151,14 +3258,43 @@ static void selsnap_st(int *x, int *y, int direction) {
                 newy += direction;
                 newx = (newx + term_cols) % term_cols;
                 if (newy < 0 || newy >= term_rows) break;
+                int wrap_row = direction > 0 ? *y : newy;
+                line = tgetline(wrap_row);
+                if (!line || !(line[term_cols - 1].mode & ATTR_WRAP))
+                    break;
             }
+            if (newx >= visual_line_length(newy))
+                break;
+            line = tgetline(newy);
+            if (!line) break;
             delim = sel_cell_is_delim(newy, newx);
-            if (delim != prevdelim) break;
-            *x = newx; *y = newy; prevdelim = delim;
+            if (!(line[newx].mode & ATTR_WDUMMY) &&
+                (delim != prevdelim ||
+                 (delim && line[newx].u != previous)))
+                break;
+            *x = newx;
+            *y = newy;
+            previous = line[newx].u;
+            prevdelim = delim;
         }
         break;
     case SNAP_LINE:
         *x = (direction < 0) ? 0 : (term_cols - 1);
+        if (direction < 0) {
+            while (*y > 0) {
+                line = tgetline(*y - 1);
+                if (!line || !(line[term_cols - 1].mode & ATTR_WRAP))
+                    break;
+                (*y)--;
+            }
+        } else {
+            while (*y < term_rows - 1) {
+                line = tgetline(*y);
+                if (!line || !(line[term_cols - 1].mode & ATTR_WRAP))
+                    break;
+                (*y)++;
+            }
+        }
         break;
     }
 }
@@ -3176,11 +3312,18 @@ static int selection_bounds(int *sr, int *sc, int *er, int *ec) {
         *sc = (ac<bc)?ac:bc; *ec = (ac<bc)?bc:ac;
         return 1;
     }
-    if (ar * term_cols + ac > br * term_cols + bc) {
+    if (ar > br || (ar == br && ac > bc)) {
         int t; t=ar;ar=br;br=t; t=ac;ac=bc;bc=t;
     }
     *sr=ar; *sc=ac; *er=br; *ec=bc;
     if (term.sel_snap) { selsnap_st(sc,sr,-1); selsnap_st(ec,er,+1); }
+    if (term.sel_type != SEL_RECTANGULAR) {
+        int len = visual_line_length(*sr);
+        if (len < *sc)
+            *sc = len;
+        if (visual_line_length(*er) <= *ec)
+            *ec = term_cols - 1;
+    }
     return 1;
 }
 
@@ -3188,6 +3331,7 @@ void selstart(int col, int row, int snap, int type) {
     term.sel_type = type;
     term.sel_snap = snap;
     term.sel_active = 1;
+    term.sel_alt_screen = term.alt_screen_active;
     term.sel_anchor_row = term.sel_row = row;
     term.sel_anchor_col = term.sel_col = col;
     tfulldirt();
@@ -3221,6 +3365,7 @@ int selisactive(void) {
 int selected(int col, int row) {
     int sr, sc, er, ec;
     if (!selection_bounds(&sr, &sc, &er, &ec)) return 0;
+    if (term.sel_alt_screen != term.alt_screen_active) return 0;
     if (row < sr || row > er) return 0;
     if (term.sel_type == SEL_RECTANGULAR) return (col >= sc && col <= ec);
     if (sr == er) return (col >= sc && col <= ec);
@@ -3231,31 +3376,60 @@ int selected(int col, int row) {
 
 char *getsel(void) {
     int sr, sc, er, ec;
+    size_t row_capacity;
+    size_t selected_rows;
+    size_t max_size;
+    size_t pos = 0;
+    char *buf;
+
     if (!selection_bounds(&sr, &sc, &er, &ec)) return NULL;
 
-    size_t max_size = (size_t)term_rows * (size_t)term_cols * 64 + (size_t)term_rows + 1;
-    char *buf = malloc(max_size);
+    selected_rows = (size_t)(er - sr + 1);
+    if ((size_t)term_cols > (SIZE_MAX - 1) / MAX_CLUSTER_UTF8)
+        return NULL;
+    row_capacity = (size_t)term_cols * MAX_CLUSTER_UTF8 + 1;
+    if (selected_rows > (SIZE_MAX - 1) / row_capacity)
+        return NULL;
+    max_size = selected_rows * row_capacity + 1;
+    buf = malloc(max_size);
     if (!buf) return NULL;
-    size_t pos = 0;
     buf[0] = '\0';
 
     for (int r = sr; r <= er; r++) {
+        const Glyph *line = tgetline(r);
+        int line_len = visual_line_length(r);
         int cstart = (term.sel_type == SEL_RECTANGULAR) ? sc : ((r == sr) ? sc : 0);
-        int cend   = (term.sel_type == SEL_RECTANGULAR) ? ec : ((r == er) ? ec : (term_cols - 1));
-        size_t line_start = pos;
+        int lastx = (term.sel_type == SEL_RECTANGULAR) ? ec : ((r == er) ? ec : (term_cols - 1));
+        int cend;
+        uint16_t last_mode = 0;
+
+        if (!line || line_len == 0) {
+            buf[pos++] = '\n';
+            continue;
+        }
+        cend = lastx < line_len - 1 ? lastx : line_len - 1;
+        while (cend >= cstart &&
+               (line[cend].u == 0 || line[cend].u == ' '))
+            cend--;
+        if (cend >= 0)
+            last_mode = line[cend].mode;
+
         for (int c = cstart; c <= cend; c++) {
-            char cluster[64];
-            size_t glen = term_render_cluster(r, c, cluster, sizeof cluster);
+            char cluster[MAX_CLUSTER_UTF8];
+            size_t glen;
+            if (line[c].mode & ATTR_WDUMMY)
+                continue;
+            glen = term_render_visual_cluster(r, c, cluster, sizeof cluster);
             if (glen == 0) { glen = 1; cluster[0] = ' '; cluster[1] = '\0'; }
             if (pos + glen >= max_size - 2) break;
             memcpy(&buf[pos], cluster, glen);
             pos += glen;
         }
-        /* Strip trailing spaces on each line. */
-        while (pos > line_start && buf[pos-1] == ' ') pos--;
-        if (pos < max_size - 1) buf[pos++] = '\n';
-        buf[pos] = '\0';
+        if ((r < er || lastx >= line_len) &&
+            (!(last_mode & ATTR_WRAP) || term.sel_type == SEL_RECTANGULAR))
+            buf[pos++] = '\n';
     }
+    buf[pos] = '\0';
     return buf;
 }
 

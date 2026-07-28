@@ -863,26 +863,11 @@ static void resolve_cell_colors(uint32_t in_fg, uint32_t in_bg, uint16_t mode, i
 static int draw_full_refresh = 1;
 static int prev_cursor_row = -1;
 
-/* Phase 3.6: encode cluster for rendering into out[cap].
-   live_row >= 0: index into term_lines[] — uses term_render_cluster for full
-   cluster (base + combining marks from side-channel).
-   live_row < 0: history / scrollback row — only base codepoint is available.
-   Returns bytes written (NUL not counted), 0 for empty/error. */
-static size_t encode_render_cluster(int live_row, int col, const Glyph *cell,
+/* Encode the cluster shown at a visual row, including scrollback marks. */
+static size_t encode_render_cluster(int visual_row, int col, const Glyph *cell,
                                     char *out, size_t cap) {
-    if (!out || cap == 0) return 0;
-    if (live_row >= 0) {
-        return term_render_cluster(live_row, col, out, cap);
-    }
-    /* History / scrollback: encode base codepoint only */
-    if (cell->u == 0) { out[0] = '\0'; return 0; }
-    utf8proc_uint8_t buf[4];
-    utf8proc_ssize_t r = utf8proc_encode_char((utf8proc_int32_t)cell->u, buf);
-    if (r <= 0 || (size_t)r >= cap) { out[0] = '\0'; return 0; }
-    size_t n = (size_t)r;
-    for (size_t i = 0; i < n; i++) out[i] = (char)buf[i];
-    out[n] = '\0';
-    return n;
+    (void)cell;
+    return term_render_visual_cluster(visual_row, col, out, cap);
 }
 
 void draw_text(Display *display, Window window, GC gc) {
@@ -953,11 +938,6 @@ void draw_text(Display *display, Window window, GC gc) {
         if (!full && term_lines && !term_lines[r].dirty) continue;
         if (!row_cells) continue;
 
-        /* live_row >= 0 means this visual row maps directly to term_lines[live_row].
-           History rows (scrollback) have live_row == -1; combining marks not available. */
-        int live_row = (scrollback_offset <= 0) ? r
-                     : (r >= scrollback_offset ? r - scrollback_offset : -1);
-
         int x = LEFT_PAD;
         int y = baseline0 + r * (g_cell_h + line_gap);
         int row_top = y - xft_font->ascent;
@@ -1013,8 +993,8 @@ void draw_text(Display *display, Window window, GC gc) {
                 fg_color = get_xft_color(display, window, fg_val, 0, (cell->mode & ATTR_FAINT) != 0);
 
                 {
-                    char cluster[64];
-                    size_t cluster_len = encode_render_cluster(live_row, c, cell, cluster, sizeof cluster);
+                    char cluster[MAX_CLUSTER_UTF8];
+                    size_t cluster_len = encode_render_cluster(r, c, cell, cluster, sizeof cluster);
                     if (cluster_len > 0) {
                         utf8proc_int32_t cp;
                         ssize_t rs = utf8proc_iterate((const uint8_t *)cluster, (utf8proc_ssize_t)cluster_len, &cp);
@@ -1098,7 +1078,7 @@ void draw_text(Display *display, Window window, GC gc) {
                                   (const FcChar8 *)snowman, 3);
                 XftDrawSetClip(draw, NULL);
             } else {
-                char cursor_cluster[64];
+                char cursor_cluster[MAX_CLUSTER_UTF8];
                 size_t cursor_cluster_len = term_render_cluster(cur_row, cur_col, cursor_cluster, sizeof cursor_cluster);
                 if (cursor_cluster_len > 0) {
                     utf8proc_int32_t cp;

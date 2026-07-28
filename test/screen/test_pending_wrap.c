@@ -13,7 +13,7 @@ int main(void) {
     test_feed_string("ABCDE");
     test_assert_cursor(0, 5);  /* virtual column past last cell (width 5 → col 5) */
     test_feed_string("F");
-    test_assert_cell(0, 4, "E", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
+    test_assert_cell(0, 4, "E", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, ATTR_WRAP);
     test_assert_cell(1, 0, "F", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
     test_assert_cursor(1, 1);
 
