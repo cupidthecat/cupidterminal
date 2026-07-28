@@ -33,6 +33,8 @@ static PtySession g_pty_session = {
 };
 static int printer_fd = STDOUT_FILENO;
 static int printer_fd_owned = 0;
+static int line_length(const Glyph *line);
+static int visual_line_length(int row);
 
 static void printer_write(const void *buf, size_t len) {
     const unsigned char *p = buf;
@@ -124,7 +126,7 @@ int tprinter_open(const char *path) {
         printer_fd = STDOUT_FILENO;
         printer_fd_owned = 0;
     } else {
-        printer_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
+        printer_fd = open(path, O_WRONLY | O_CREAT | O_CLOEXEC, 0666);
         printer_fd_owned = 1;
     }
     if (printer_fd < 0) {
@@ -150,9 +152,13 @@ void tprinter_toggle(void) {
 
 void tprinter_screen(void) {
     for (int row = 0; row < term_rows; row++) {
-        for (int col = 0; col < term_cols; col++) {
+        const Glyph *line = term_lines[row].line;
+        int line_len = line_length(line);
+        for (int col = 0; col < line_len; col++) {
             char cluster[MAX_CLUSTER_UTF8];
             size_t len = term_render_cluster(row, col, cluster, sizeof(cluster));
+            if (line[col].mode & ATTR_WDUMMY)
+                continue;
             if (len == 0)
                 printer_write(" ", 1);
             else
@@ -963,45 +969,39 @@ static void cancel_pending_wrap(Term *state) {
 }
 
 static void save_cursor_state(Term *state) {
+    SavedCursor *saved;
+
     if (!state) {
         return;
     }
 
-    cancel_pending_wrap(state);
-    if (state->alt_screen_active) {
-        state->alt_saved_row = state->row;
-        state->alt_saved_col = state->col;
-        state->alt_saved_fg = state->current_fg;
-        state->alt_saved_bg = state->current_bg;
-        state->alt_saved_mode = state->current_mode;
-    } else {
-        state->saved_row = state->row;
-        state->saved_col = state->col;
-        state->saved_fg = state->current_fg;
-        state->saved_bg = state->current_bg;
-        state->saved_mode = state->current_mode;
-    }
+    saved = &state->saved_cursor[state->alt_screen_active ? 1 : 0];
+    saved->row = state->row;
+    saved->col = state->col;
+    saved->fg = state->current_fg;
+    saved->bg = state->current_bg;
+    saved->mode = state->current_mode;
+    saved->origin_mode = state->origin_mode;
+    saved->wrap_next = state->wrap_next;
+    saved->wrap_overwrite_next = state->wrap_overwrite_next;
 }
 
 static void restore_cursor_state(Term *state) {
+    const SavedCursor *saved;
+
     if (!state) {
         return;
     }
 
-    cancel_pending_wrap(state);
-    if (state->alt_screen_active) {
-        state->row = state->alt_saved_row;
-        state->col = state->alt_saved_col;
-        state->current_fg = state->alt_saved_fg;
-        state->current_bg = state->alt_saved_bg;
-        state->current_mode = state->alt_saved_mode;
-    } else {
-        state->row = state->saved_row;
-        state->col = state->saved_col;
-        state->current_fg = state->saved_fg;
-        state->current_bg = state->saved_bg;
-        state->current_mode = state->saved_mode;
-    }
+    saved = &state->saved_cursor[state->alt_screen_active ? 1 : 0];
+    state->row = saved->row;
+    state->col = saved->col;
+    state->current_fg = saved->fg;
+    state->current_bg = saved->bg;
+    state->current_mode = saved->mode;
+    state->origin_mode = saved->origin_mode;
+    state->wrap_next = saved->wrap_next;
+    state->wrap_overwrite_next = saved->wrap_overwrite_next;
     clamp_cursor(state);
 }
 
@@ -1350,6 +1350,7 @@ static void wrap_to_next_line(Term *state) {
 
 static void osc_reset(Term *state) {
     state->osc_active = 0;
+    state->osc_type = '\0';
     state->osc_esc_pending = 0;
     state->osc_overflow = 0;
     state->osc_len = 0;
@@ -1471,30 +1472,30 @@ static size_t osc52_decode_base64(const char *encoded, uint8_t *out, size_t out_
  * Returns TRUECOLOR(r,g,b), or 0 on failure.
  */
 static uint32_t parse_x11_color(const char *spec) {
-    unsigned int r, g, b;
-    if (!spec || !*spec) return 0;
-    if (*spec == '#') {
-        size_t n = strlen(spec + 1);
-        if (n == 6) {
-            if (sscanf(spec + 1, "%02x%02x%02x", &r, &g, &b) == 3)
-                return TRUECOLOR(r, g, b);
-        } else if (n == 12) {
-            unsigned int r4, g4, b4;
-            if (sscanf(spec + 1, "%04x%04x%04x", &r4, &g4, &b4) == 3)
-                return TRUECOLOR(r4 >> 8, g4 >> 8, b4 >> 8);
-        }
-    } else if (strncmp(spec, "rgb:", 4) == 0) {
-        if (sscanf(spec + 4, "%x/%x/%x", &r, &g, &b) == 3) {
-            if (r > 0xFF) r >>= 8;
-            if (g > 0xFF) g >>= 8;
-            if (b > 0xFF) b >>= 8;
-            return TRUECOLOR(r, g, b);
-        }
-    }
-    return 0;
+    uint32_t color;
+    if (!spec || !*spec || xparsecolor(spec, &color) != 0)
+        return 0;
+    return color;
 }
 
-static void osc_finalize(Term *state) {
+static void osc_color_response(int command, int index, int is_palette,
+    terminal_response_fn response_fn, void *response_ctx) {
+    uint8_t r, g, b;
+    char response[40];
+    int len;
+
+    if (!response_fn || xgetcolor(index, &r, &g, &b) != 0)
+        return;
+    len = snprintf(response, sizeof response,
+        is_palette ? "\033]4;%d;rgb:%02x%02x/%02x%02x/%02x%02x\a"
+                   : "\033]%d;rgb:%02x%02x/%02x%02x/%02x%02x\a",
+        command, r, r, g, g, b, b);
+    if (len > 0 && (size_t)len < sizeof response)
+        response_fn((const uint8_t *)response, (size_t)len, response_ctx);
+}
+
+static void osc_finalize(Term *state, terminal_response_fn response_fn,
+    void *response_ctx) {
     const char *payload;
     const char *semi;
     const char *arg1;
@@ -1512,17 +1513,22 @@ static void osc_finalize(Term *state) {
 
     state->osc_buf[state->osc_len] = '\0';
     payload = state->osc_buf;
-    semi = strchr(payload, ';');
-    if (!semi) {
+    if (state->osc_type == 'k') {
+        xsettitle(state->osc_buf);
         osc_reset(state);
         return;
     }
+    semi = strchr(payload, ';');
+    if (!semi) {
+        cmd = (int)strtol(payload, NULL, 10);
+        arg1 = "";
+    } else {
+        cmd = (int)strtol(payload, NULL, 10);
+        arg1 = semi + 1;
+    }
 
-    cmd = (int)strtol(payload, NULL, 10);
-    arg1 = semi + 1;
-
-    if (cmd == 0 || cmd == 2) {
-        const char *title = semi + 1;
+    if (cmd == 0 || cmd == 1 || cmd == 2) {
+        const char *title = arg1;
         title_len = strlen(title);
         if (title_len >= sizeof(state->window_title)) {
             title_len = sizeof(state->window_title) - 1;
@@ -1530,7 +1536,10 @@ static void osc_finalize(Term *state) {
         memcpy(state->window_title, title, title_len);
         state->window_title[title_len] = '\0';
         state->title_dirty = 1;
-        xsettitle(state->window_title);
+        if (cmd == 0 || cmd == 2)
+            xsettitle(state->window_title);
+        if (cmd == 0 || cmd == 1)
+            xseticontitle(state->window_title);
     } else if (cmd == 4) {
         /* OSC 4;index;color – set palette entry */
         const char *idx_end;
@@ -1539,7 +1548,9 @@ static void osc_finalize(Term *state) {
         idx = (int)strtol(arg1, (char **)&idx_end, 10);
         if (idx_end > arg1 && *idx_end == ';' && idx >= 0 && idx < 256) {
             const char *colstr = idx_end + 1;
-            if (strcmp(colstr, "?") != 0) {
+            if (strcmp(colstr, "?") == 0) {
+                osc_color_response(idx, idx, 1, response_fn, response_ctx);
+            } else {
                 col = parse_x11_color(colstr);
                 if (col) {
                     state->palette_override[idx] = col;
@@ -1550,7 +1561,11 @@ static void osc_finalize(Term *state) {
         }
     } else if (cmd == 10 || cmd == 11 || cmd == 12) {
         /* OSC 10/11/12;color – set fg/bg/cursor dynamic color */
-        if (strcmp(arg1, "?") != 0) {
+        if (strcmp(arg1, "?") == 0) {
+            int index = cmd == 10 ? (int)defaultfg :
+                        cmd == 11 ? (int)defaultbg : (int)defaultcs;
+            osc_color_response(cmd, index, 0, response_fn, response_ctx);
+        } else {
             uint32_t col = parse_x11_color(arg1);
             if (col) {
                 if (cmd == 10)      state->osc_fg_color = col;
@@ -1617,16 +1632,12 @@ static void terminal_soft_reset(Term *state) {
     state->col = 0;
     treset(state);
 
-    state->saved_row = 0;
-    state->saved_col = 0;
-    state->saved_fg = COLOR_DEFAULT_FG;
-    state->saved_bg = COLOR_DEFAULT_BG;
-    state->saved_mode = 0;
-    state->alt_saved_row = 0;
-    state->alt_saved_col = 0;
-    state->alt_saved_fg = COLOR_DEFAULT_FG;
-    state->alt_saved_bg = COLOR_DEFAULT_BG;
-    state->alt_saved_mode = 0;
+    for (int i = 0; i < 2; i++) {
+        state->saved_cursor[i] = (SavedCursor){
+            .fg = COLOR_DEFAULT_FG,
+            .bg = COLOR_DEFAULT_BG
+        };
+    }
 
     state->cursor_visible = 1;
     state->scroll_top = -1;
@@ -1661,6 +1672,15 @@ static void terminal_soft_reset(Term *state) {
     state->scrollback_offset = 0;
     state->osc52_len = 0;
     state->osc52_pending = 0;
+    state->osc_fg_color = 0;
+    state->osc_bg_color = 0;
+    state->osc_cs_color = 0;
+    memset(state->palette_override, 0, sizeof state->palette_override);
+    memset(state->palette_overridden, 0, sizeof state->palette_overridden);
+    snprintf(state->window_title, sizeof state->window_title, "%s",
+             "cupidterminal");
+    state->title_dirty = 1;
+    xsettitle(NULL);
     osc_reset(state);
 
     if (tab_stops) {
@@ -1761,14 +1781,14 @@ void tresize(int new_rows, int new_cols) {
     }
 
     clamp_cursor(&term);
-    if (term.saved_row < 0) term.saved_row = 0;
-    if (term.saved_row >= term_rows) term.saved_row = term_rows - 1;
-    if (term.saved_col < 0) term.saved_col = 0;
-    if (term.saved_col >= term_cols) term.saved_col = term_cols - 1;
-    if (term.alt_saved_row < 0) term.alt_saved_row = 0;
-    if (term.alt_saved_row >= term_rows) term.alt_saved_row = term_rows - 1;
-    if (term.alt_saved_col < 0) term.alt_saved_col = 0;
-    if (term.alt_saved_col >= term_cols) term.alt_saved_col = term_cols - 1;
+    for (int i = 0; i < 2; i++) {
+        if (term.saved_cursor[i].row < 0) term.saved_cursor[i].row = 0;
+        if (term.saved_cursor[i].row >= term_rows)
+            term.saved_cursor[i].row = term_rows - 1;
+        if (term.saved_cursor[i].col < 0) term.saved_cursor[i].col = 0;
+        if (term.saved_cursor[i].col >= term_cols)
+            term.saved_cursor[i].col = term_cols - 1;
+    }
 }
 
 void tnew(Term *state) {
@@ -1803,8 +1823,10 @@ void tnew(Term *state) {
     state->csi_pending_len = 0;
     state->current_fg = COLOR_DEFAULT_FG;
     state->current_bg = COLOR_DEFAULT_BG;
-    state->saved_fg = COLOR_DEFAULT_FG;
-    state->saved_bg = COLOR_DEFAULT_BG;
+    state->saved_cursor[0].fg = COLOR_DEFAULT_FG;
+    state->saved_cursor[0].bg = COLOR_DEFAULT_BG;
+    state->saved_cursor[1].fg = COLOR_DEFAULT_FG;
+    state->saved_cursor[1].bg = COLOR_DEFAULT_BG;
     state->cursor_visible = 1;
     state->autowrap_mode = 1;
     state->origin_mode = 0;
@@ -2044,8 +2066,12 @@ static void csihandle(const char *seq, int len, Term *state,
             int p = param_count ? param_values[0] : 0;
             if (p == 0) tprinter_screen();
             else if (p == 1 && state->row >= 0 && state->row < term_rows) {
-                for (int col = 0; col < term_cols; col++) {
+                const Glyph *line = term_lines[state->row].line;
+                int line_len = line_length(line);
+                for (int col = 0; col < line_len; col++) {
                     char cluster[MAX_CLUSTER_UTF8];
+                    if (line[col].mode & ATTR_WDUMMY)
+                        continue;
                     size_t n = term_render_cluster(state->row, col, cluster, sizeof(cluster));
                     printer_write(n ? cluster : " ", n ? n : 1);
                 }
@@ -2336,28 +2362,26 @@ static void csihandle(const char *seq, int len, Term *state,
                     state->current_bg = (uint32_t)(p - 100 + 8);
                 } else if (p == 49) {
                     state->current_bg = COLOR_DEFAULT_BG;
-                } else if (p == 38 || p == 48) {
+                } else if (p == 38 || p == 48 || p == 58) {
                     if (i + 2 < param_count && param_values[i + 1] == 5) {
                         int n = param_values[i + 2];
-                        if (n < 0) n = 0;
-                        if (n > 255) n = 255;
-                        if (p == 38) {
+                        if (p == 38 && n >= 0 && n <= 255) {
                             state->current_fg = (uint32_t)n;
-                        } else {
+                        } else if (p == 48 && n >= 0 && n <= 255) {
                             state->current_bg = (uint32_t)n;
                         }
                         i += 2;
                     } else if (i + 4 < param_count && param_values[i + 1] == 2) {
                         /* 38;2;r;g;b or 48;2;r;g;b */
                         int r = param_values[i + 2], g = param_values[i + 3], b = param_values[i + 4];
-                        if (r < 0) r = 0; else if (r > 255) r = 255;
-                        if (g < 0) g = 0; else if (g > 255) g = 255;
-                        if (b < 0) b = 0; else if (b > 255) b = 255;
-                        uint32_t rgb = TRUECOLOR(r, g, b);
-                        if (p == 38) {
-                            state->current_fg = rgb;
-                        } else {
-                            state->current_bg = rgb;
+                        if (r >= 0 && r <= 255 && g >= 0 && g <= 255 &&
+                            b >= 0 && b <= 255) {
+                            uint32_t rgb = TRUECOLOR(r, g, b);
+                            if (p == 38) {
+                                state->current_fg = rgb;
+                            } else if (p == 48) {
+                                state->current_bg = rgb;
+                            }
                         }
                         i += 4;
                     }
@@ -2847,7 +2871,7 @@ void twrite(const uint8_t *bytes, size_t len, Term *state,
 
             if (state->osc_esc_pending) {
                 if (b == '\\') {
-                    osc_finalize(state);
+                    osc_finalize(state, response_fn, response_ctx);
                     continue;
                 }
                 osc_append_byte(state, 0x1B);
@@ -2855,7 +2879,7 @@ void twrite(const uint8_t *bytes, size_t len, Term *state,
             }
 
             if (b == 0x07 || b == 0x9C || b == 0x18 || b == 0x1A) {
-                osc_finalize(state);
+                osc_finalize(state, response_fn, response_ctx);
                 continue;
             }
             if (b == 0x1B) {
@@ -3003,6 +3027,17 @@ void twrite(const uint8_t *bytes, size_t len, Term *state,
             if (buf[i] == ']') {
                 i++;
                 state->osc_active = 1;
+                state->osc_type = ']';
+                state->osc_esc_pending = 0;
+                state->osc_overflow = 0;
+                state->osc_len = 0;
+                continue;
+            }
+
+            if (buf[i] == 'k') {
+                i++;
+                state->osc_active = 1;
+                state->osc_type = 'k';
                 state->osc_esc_pending = 0;
                 state->osc_overflow = 0;
                 state->osc_len = 0;
@@ -3144,7 +3179,7 @@ void twrite(const uint8_t *bytes, size_t len, Term *state,
             if (state->utf8_len == 0 && b == 0x9C) {
                 state->utf8_len = 0;
                 if (state->osc_active) {
-                    osc_finalize(state);
+                    osc_finalize(state, response_fn, response_ctx);
                 }
                 state->str_ignore_active = 0;
                 state->str_ignore_esc_pending = 0;
@@ -3153,6 +3188,7 @@ void twrite(const uint8_t *bytes, size_t len, Term *state,
             if (state->utf8_len == 0 && b == 0x9D) {
                 state->utf8_len = 0;
                 state->osc_active = 1;
+                state->osc_type = ']';
                 state->osc_esc_pending = 0;
                 state->osc_len = 0;
                 continue;
@@ -3214,8 +3250,7 @@ size_t tpastefmt(const uint8_t *input, size_t input_len, int bracketed_mode,
 /* Selection API — all selection state lives in Term; x.c calls these.      */
 /* ======================================================================== */
 
-static int visual_line_length(int row) {
-    const Glyph *line = tgetline(row);
+static int line_length(const Glyph *line) {
     int len = term_cols;
 
     if (!line || term_cols <= 0)
@@ -3225,6 +3260,10 @@ static int visual_line_length(int row) {
     while (len > 0 && (line[len - 1].u == 0 || line[len - 1].u == ' '))
         len--;
     return len;
+}
+
+static int visual_line_length(int row) {
+    return line_length(tgetline(row));
 }
 
 /* Returns 1 if (row,col) cluster text is a word-delimiter. */
@@ -3532,8 +3571,7 @@ run:
 
     xinit((int)cols, (int)rows, &g_pty_session);
 
-    if (tprinter_open(opt_io) == -1)
-        return EXIT_FAILURE;
+    (void)tprinter_open(opt_io);
 
     if (pty_session_spawn(&g_pty_session, opt_line, SHELL, opt_cmd, TERM) == -1)
         return EXIT_FAILURE;

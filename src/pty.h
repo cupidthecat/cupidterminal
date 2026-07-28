@@ -7,6 +7,9 @@
 
 #define PTY_WRITE_QUEUE_LIMIT (1024u * 1024u)
 
+int pty_build_stty_command(char *command, size_t capacity,
+                           const char *base, char *const extra_args[]);
+
 typedef struct {
     int master_fd;
     pid_t child_pid;

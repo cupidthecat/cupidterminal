@@ -17,5 +17,7 @@ void test_assert_mode(const char *name, int actual, int expected);
 char *test_snapshot_screen(void);
 void test_free_snapshot(char *snapshot);
 void test_print_ok(const char *suite_name);
+const char *test_last_title(void);
+const char *test_last_icon_title(void);
 
 #endif // TEST_COMMON_H

@@ -9,13 +9,50 @@
  * st.c now calls xsettitle/xbell at parse time; tests must satisfy the
  * linker without pulling in X11.  These are intentionally silent.
  */
+static char captured_title[256];
+static char captured_icon_title[256];
+
 void xbell(void) {}
-void xsettitle(char *p) { (void)p; }
+void xsettitle(char *p) {
+    snprintf(captured_title, sizeof captured_title, "%s",
+             p ? p : "cupidterminal");
+}
+void xseticontitle(char *p) {
+    snprintf(captured_icon_title, sizeof captured_icon_title, "%s",
+             p ? p : "cupidterminal");
+}
 void xsetsel(char *str) { (void)str; }
+int xparsecolor(const char *name, uint32_t *color) {
+    unsigned int r, g, b;
+    if (!name || !color)
+        return -1;
+    if (sscanf(name, "#%02x%02x%02x", &r, &g, &b) != 3)
+        return -1;
+    *color = TRUECOLOR(r, g, b);
+    return 0;
+}
+int xgetcolor(int x, uint8_t *r, uint8_t *g, uint8_t *b) {
+    static const uint8_t defaults[][3] = {
+        [COLOR_DEFAULT_FG] = {0xe5, 0xe5, 0xe5},
+        [COLOR_DEFAULT_BG] = {0x00, 0x00, 0x00}
+    };
+    if (!r || !g || !b || x < 0 || x > COLOR_DEFAULT_BG)
+        return -1;
+    *r = defaults[x][0];
+    *g = defaults[x][1];
+    *b = defaults[x][2];
+    return 0;
+}
+
+const char *test_last_title(void) { return captured_title; }
+const char *test_last_icon_title(void) { return captured_icon_title; }
 
 /* Provide config symbols for cupid.c when building without its main(). */
 unsigned int tabspaces = 8;
 char *vtiden = "\033[?6c";
+unsigned int defaultfg = COLOR_DEFAULT_FG;
+unsigned int defaultbg = COLOR_DEFAULT_BG;
+unsigned int defaultcs = 256;
 int allowwindowops = 1;  /* enable OSC 52 for unit tests */
 int allowaltscreen = 1;
 char *utmp = NULL;
@@ -28,6 +65,8 @@ static void failf(const char *message) {
 }
 
 void test_reset_terminal(int rows, int cols) {
+    captured_title[0] = '\0';
+    captured_icon_title[0] = '\0';
     tnew(&term);
     if (rows > 0 && cols > 0) {
         tresize(rows, cols);

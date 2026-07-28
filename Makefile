@@ -49,7 +49,7 @@ src/config.h:
 $(TARGET): src/config.h $(OBJS)
 	$(CC) $(OBJS) -o $(TARGET) $(LDFLAGS)
 
-build/%.o: src/%.c src/config.h
+build/%.o: src/%.c src/cupid.h src/pty.h src/xwin.h src/config.h
 	mkdir -p build
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -61,7 +61,7 @@ $(TEST_COMMON_OBJ): $(TEST_COMMON_SRC) test/common/test_common.h src/cupid.h
 	$(CC) $(TEST_CFLAGS) -c $< -o $@
 
 # cupid_test.o: cupid.c compiled without main() and argv globals (for unit tests)
-build/cupid_test.o: src/cupid.c src/config.h
+build/cupid_test.o: src/cupid.c src/cupid.h src/xwin.h src/config.h
 	mkdir -p build
 	$(CC) $(TEST_CFLAGS) -DCUPID_NO_MAIN -c src/cupid.c -o $@
 

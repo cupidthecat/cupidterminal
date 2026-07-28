@@ -83,11 +83,21 @@ typedef void (*terminal_response_fn)(const uint8_t *bytes, size_t len, void *ctx
 typedef struct {
     int row;
     int col;
+    uint32_t fg;
+    uint32_t bg;
+    uint16_t mode;
+    int origin_mode;
+    int wrap_next;
+    int wrap_overwrite_next;
+} SavedCursor;
+
+typedef struct {
+    int row;
+    int col;
     uint32_t current_fg;
     uint32_t current_bg;
     uint16_t current_mode;
-    int saved_row; int saved_col;
-    uint32_t saved_fg; uint32_t saved_bg; uint16_t saved_mode;  /* DECSC/DECRC */
+    SavedCursor saved_cursor[2];  /* primary and alternate DECSC/DECRC */
     int cursor_visible;  /* 0 = hidden (DECRST ?25), 1 = visible (default) */
     int scroll_top;     /* 0-based, inclusive; -1 = use 0 */
     int scroll_bottom;  /* 0-based, inclusive; -1 = use term_rows-1 */
@@ -113,11 +123,6 @@ typedef struct {
     int keyboard_lock;           /* KAM 2: suppress keyboard input */
     int meta_eight_bit;          /* DECSET 1034: Meta sets the high bit */
 
-    int alt_saved_row;
-    int alt_saved_col;
-    uint32_t alt_saved_fg;
-    uint32_t alt_saved_bg;
-    uint16_t alt_saved_mode;
     int alt_saved_scroll_top;
     int alt_saved_scroll_bottom;
 
@@ -128,6 +133,7 @@ typedef struct {
     int utf8_len;
 
     int osc_active;
+    char osc_type;
     int osc_esc_pending;
     int osc_overflow;
     char osc_buf[512];

@@ -41,6 +41,8 @@ void xfinishdraw(void);
 void xstartdraw(void);
 void xloadcols(void);
 int  xsetcolorname(int x, const char *name);
+int  xparsecolor(const char *name, uint32_t *color);
+int  xgetcolor(int x, uint8_t *r, uint8_t *g, uint8_t *b);
 void xseticontitle(char *p);
 void xsettitle(char *p);
 void xsetsel(char *str);

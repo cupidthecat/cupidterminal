@@ -163,27 +163,50 @@ static int pty_session_wait_for_reap(PtySession *session, int timeout_ms) {
  * Run stty_args via system(3) on the current terminal (stdin = slave pty /
  * serial device).  Only used in serial-line mode, matching st's stty().
  */
-static void run_stty(char **extra_args) {
-    char cmd[4096];
-    const char *base = stty_args ? stty_args : "stty raw pass8 nl -echo -iexten -cstopb 38400";
-    size_t n = strlen(base);
-    if (n >= sizeof(cmd) - 1) return;
-    memcpy(cmd, base, n);
-    cmd[n] = '\0';
+int pty_build_stty_command(char *command, size_t capacity,
+                           const char *base, char *const extra_args[]) {
+    size_t n;
+
+    if (!command || capacity == 0 || !base) {
+        errno = EINVAL;
+        return -1;
+    }
+    n = strlen(base);
+    if (n >= capacity) {
+        errno = E2BIG;
+        return -1;
+    }
+    memcpy(command, base, n + 1);
 
     if (extra_args) {
-        for (char **p = extra_args; *p; p++) {
+        for (char *const *p = extra_args; *p; p++) {
             size_t slen = strlen(*p);
-            if (n + 1 + slen >= sizeof(cmd) - 1) break;
-            cmd[n++] = ' ';
-            memcpy(cmd + n, *p, slen);
+            if (slen > capacity - n - 1 || n + 1 + slen >= capacity) {
+                errno = E2BIG;
+                return -1;
+            }
+            command[n++] = ' ';
+            memcpy(command + n, *p, slen);
             n += slen;
-            cmd[n] = '\0';
+            command[n] = '\0';
         }
     }
+    return 0;
+}
 
-    if (system(cmd) != 0)
-        perror("stty");
+static int run_stty(char **extra_args) {
+    char cmd[4096];
+    const char *base = stty_args ? stty_args : "stty raw pass8 nl -echo -iexten -cstopb 38400";
+    if (pty_build_stty_command(cmd, sizeof cmd, base, extra_args) == -1) {
+        fprintf(stderr, "cupidterminal: stty parameters are too long\n");
+        return -1;
+    }
+
+    if (system(cmd) != 0) {
+        fprintf(stderr, "cupidterminal: stty command failed\n");
+        return -1;
+    }
+    return 0;
 }
 
 /*
@@ -293,7 +316,11 @@ int pty_session_spawn(PtySession *session, const char *line,
             close(fd);
             return -1;
         }
-        run_stty(args);
+        if (run_stty(args) == -1) {
+            close(fd);
+            session->master_fd = -1;
+            return -1;
+        }
         /* In serial mode there is no child process; fd is our "master" */
         if (fcntl(fd, F_SETFL, O_NONBLOCK) == -1) {
             perror("fcntl O_NONBLOCK (serial)");

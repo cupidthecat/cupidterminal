@@ -1160,10 +1160,16 @@ static void set_utf8_window_property(char *p, int icon) {
 }
 
 void xsettitle(char *p) {
+    extern char *opt_title;
+    if (!p)
+        p = (opt_title && opt_title[0]) ? opt_title : "cupidterminal";
     set_utf8_window_property(p, 0);
 }
 
 void xseticontitle(char *p) {
+    extern char *opt_title;
+    if (!p)
+        p = (opt_title && opt_title[0]) ? opt_title : "cupidterminal";
     set_utf8_window_property(p, 1);
 }
 
@@ -1205,6 +1211,30 @@ int xsetcolorname(int x, const char *name) {
     (void)x; (void)name;
     /* UNUSED: st.c has no caller. Color name overrides are not yet wired;
        colors are resolved at draw time by draw_text(). */
+    return 0;
+}
+
+int xparsecolor(const char *name, uint32_t *color) {
+    XColor parsed;
+
+    if (!global_display || !name || !color ||
+        !XParseColor(global_display,
+                     DefaultColormap(global_display, DefaultScreen(global_display)),
+                     name, &parsed))
+        return -1;
+    *color = TRUECOLOR(parsed.red >> 8, parsed.green >> 8, parsed.blue >> 8);
+    return 0;
+}
+
+int xgetcolor(int x, uint8_t *r, uint8_t *g, uint8_t *b) {
+    XRenderColor color;
+
+    if (!r || !g || !b || x < 0)
+        return -1;
+    color = get_xrender_color((uint32_t)x, x == (int)defaultbg, 0);
+    *r = (uint8_t)(color.red >> 8);
+    *g = (uint8_t)(color.green >> 8);
+    *b = (uint8_t)(color.blue >> 8);
     return 0;
 }
 
