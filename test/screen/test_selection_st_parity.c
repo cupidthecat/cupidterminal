@@ -31,6 +31,8 @@ int main(void) {
     selrelease(2, 1);
     assert_selection("BC\nFG",
         "rectangular selection must follow st newline rules");
+    test_assert_true(selected(1, 0) && selected(2, 1) && !selected(0, 1),
+        "selected() must interpret coordinates as column, row");
 
     test_reset_terminal(2, 5);
     test_feed_string("hello");

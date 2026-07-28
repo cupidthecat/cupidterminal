@@ -375,7 +375,12 @@ static void copy_line_contents(TermLine *dst, const TermLine *src,
         if (source->col < 0 || source->col >= copy_cols || source->n == 0)
             continue;
         if (dst->ncombs == dst->combs_cap) {
-            uint16_t cap = dst->combs_cap ? (uint16_t)(dst->combs_cap * 2) : 4;
+            uint16_t cap;
+            if (dst->ncombs == UINT16_MAX)
+                break;
+            cap = dst->combs_cap == 0 ? 4 :
+                  dst->combs_cap > UINT16_MAX / 2 ? UINT16_MAX :
+                  (uint16_t)(dst->combs_cap * 2);
             CombMark *grown = realloc(dst->combs, (size_t)cap * sizeof(*grown));
             if (!grown) {
                 fprintf(stderr, "cupidterminal: out of memory\n");
@@ -1172,7 +1177,12 @@ void term_append_comb(int row, int col, Rune cp) {
     cm = find_line_comb(tl, col);
     if (!cm) {
         if (tl->ncombs == tl->combs_cap) {
-            uint16_t new_cap = tl->combs_cap ? (uint16_t)(tl->combs_cap * 2) : 4;
+            uint16_t new_cap;
+            if (tl->ncombs == UINT16_MAX)
+                return;
+            new_cap = tl->combs_cap == 0 ? 4 :
+                      tl->combs_cap > UINT16_MAX / 2 ? UINT16_MAX :
+                      (uint16_t)(tl->combs_cap * 2);
             CombMark *grown = realloc(tl->combs, (size_t)new_cap * sizeof(*tl->combs));
             if (!grown) return;
             tl->combs = grown;

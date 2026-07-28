@@ -957,7 +957,8 @@ void draw_text(Display *display, Window window, GC gc) {
                     const Glyph *cell = &row_cells[c];
                     if (cell->mode & ATTR_WDUMMY) { cur_px += step_w; continue; }
                     int cell_span = ((cell->mode & ATTR_WIDE) && c+1 < term_cols) ? 2 : 1;
-                    int is_sel = selected(r,c) || (cell_span==2 && selected(r,c+1));
+                    int is_sel = selected(c, r) ||
+                                 (cell_span == 2 && selected(c + 1, r));
                     uint32_t fg_val, bg_val;
                     resolve_cell_colors(cell->fg, cell->bg, cell->mode, is_sel, blink_hidden, &fg_val, &bg_val);
                     bg_color = get_xft_color(display, window, bg_val, 1, 0);
@@ -989,7 +990,8 @@ void draw_text(Display *display, Window window, GC gc) {
                 if (cell->mode & ATTR_WDUMMY) { x += step_w; continue; }
                 if ((cell->mode & ATTR_WIDE) && c+1 < term_cols) cell_span = 2;
 
-                is_sel = selected(r,c) || (cell_span==2 && selected(r,c+1));
+                is_sel = selected(c, r) ||
+                         (cell_span == 2 && selected(c + 1, r));
                 resolve_cell_colors(cell->fg, cell->bg, cell->mode, is_sel, blink_hidden, &fg_val, &bg_val);
                 draw_w = g_cell_w * cell_span;
                 fg_color = get_xft_color(display, window, fg_val, 0, (cell->mode & ATTR_FAINT) != 0);
@@ -1043,7 +1045,8 @@ void draw_text(Display *display, Window window, GC gc) {
         cursor_cell = &term_lines[cur_row].line[cur_col];
         cursor_attrs = cursor_cell->mode & (ATTR_BOLD | ATTR_ITALIC | ATTR_UNDERLINE | ATTR_STRUCK);
         if ((cursor_cell->mode & ATTR_WIDE) && cur_col+1 < term_cols) cur_span = 2;
-        is_sel = selected(cur_row,cur_col) || (cur_span==2 && selected(cur_row,cur_col+1));
+        is_sel = selected(cur_col, cur_row) ||
+                 (cur_span == 2 && selected(cur_col + 1, cur_row));
 
         if (term.screen_reverse) {
             cursor_bg_idx = is_sel ? defaultcs : defaultrcs;
