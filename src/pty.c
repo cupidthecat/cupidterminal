@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <pwd.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -73,6 +74,63 @@ static void pty_session_mark_exited(PtySession *session, int status) {
     session->child_exited = 1;
     session->child_status = status;
     session->child_pid = -1;
+}
+
+static void pty_session_clear_write_buffer(PtySession *session) {
+    if (!session) return;
+    free(session->write_buf);
+    session->write_buf = NULL;
+    session->write_off = 0;
+    session->write_len = 0;
+    session->write_cap = 0;
+}
+
+static int pty_session_queue_bytes(PtySession *session,
+                                   const unsigned char *buf, size_t len) {
+    size_t pending;
+    size_t needed;
+    size_t new_cap;
+    unsigned char *grown;
+
+    if (len == 0) return 0;
+    pending = session->write_len - session->write_off;
+    if (len > PTY_WRITE_QUEUE_LIMIT - pending) {
+        errno = ENOBUFS;
+        return -1;
+    }
+
+    if (session->write_off > 0 &&
+        session->write_cap - session->write_len < len) {
+        memmove(session->write_buf,
+                session->write_buf + session->write_off, pending);
+        session->write_off = 0;
+        session->write_len = pending;
+    }
+
+    if (len > SIZE_MAX - session->write_len) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    needed = session->write_len + len;
+    if (needed > session->write_cap) {
+        new_cap = session->write_cap ? session->write_cap : 4096;
+        while (new_cap < needed) {
+            if (new_cap > SIZE_MAX / 2) {
+                new_cap = needed;
+                break;
+            }
+            new_cap *= 2;
+        }
+        grown = realloc(session->write_buf, new_cap);
+        if (!grown)
+            return -1;
+        session->write_buf = grown;
+        session->write_cap = new_cap;
+    }
+
+    memcpy(session->write_buf + session->write_len, buf, len);
+    session->write_len += len;
+    return 0;
 }
 
 static void pty_session_signal_child_group(PtySession *session, int sig) {
@@ -214,6 +272,8 @@ int pty_session_spawn(PtySession *session, const char *line,
     session->child_pid    = -1;
     session->child_exited = 0;
     session->child_status = 0;
+    pty_session_clear_write_buffer(session);
+    session->write_failed = 0;
 
     if (setenv("TERM", term_name, 1) == -1) {
         perror("setenv TERM");
@@ -340,32 +400,87 @@ int pty_session_spawn(PtySession *session, const char *line,
 /* ---------------------------------------------------------------------------
  * pty_session_write – write bytes to the PTY master fd.
  *
- * Uses a simple retry loop. The master fd is O_NONBLOCK so write() returns
- * EAGAIN rather than blocking; we break out and let the main event loop drain
- * the PTY before the caller retries. Draining inside write() would silently
- * discard shell/program output (corrupting escape sequences), so we do not
- * attempt to read the fd here — that is the main loop's job.
+ * The master fd is nonblocking. Bytes not accepted immediately are retained
+ * in an ordered queue and flushed when the event loop reports writability.
  * ---------------------------------------------------------------------------*/
 ssize_t pty_session_write(PtySession *session, const void *buf, size_t len) {
-    const char *s = (const char *)buf;
-    size_t remaining = len;
+    const unsigned char *s = (const unsigned char *)buf;
+    size_t sent = 0;
 
     if (!session || session->master_fd < 0 || !buf) return -1;
     if (len == 0) return 0;
+    if (session->write_failed) {
+        errno = EIO;
+        return -1;
+    }
 
-    while (remaining > 0) {
-        ssize_t r = write(session->master_fd, s, remaining);
+    if (pty_session_wants_write(session)) {
+        if (pty_session_queue_bytes(session, s, len) == -1) {
+            session->write_failed = 1;
+            return -1;
+        }
+        return (ssize_t)len;
+    }
+
+    while (sent < len) {
+        ssize_t r = write(session->master_fd, s + sent, len - sent);
         if (r > 0) {
-            s         += r;
-            remaining -= (size_t)r;
+            sent += (size_t)r;
         } else if (r < 0 && errno == EINTR) {
             continue;
+        } else if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            break;
         } else {
-            break; /* EAGAIN or error — caller retries on next iteration */
+            if (r == 0)
+                errno = EIO;
+            session->write_failed = 1;
+            return -1;
         }
     }
 
-    return (ssize_t)(len - remaining);
+    if (sent < len &&
+        pty_session_queue_bytes(session, s + sent, len - sent) == -1) {
+        session->write_failed = 1;
+        return -1;
+    }
+    return (ssize_t)len;
+}
+
+int pty_session_wants_write(const PtySession *session) {
+    return session && session->write_len > session->write_off;
+}
+
+int pty_session_flush(PtySession *session) {
+    if (!session || session->master_fd < 0) {
+        errno = EBADF;
+        return -1;
+    }
+    if (session->write_failed) {
+        errno = EIO;
+        return -1;
+    }
+
+    while (pty_session_wants_write(session)) {
+        ssize_t n = write(session->master_fd,
+                          session->write_buf + session->write_off,
+                          session->write_len - session->write_off);
+        if (n > 0) {
+            session->write_off += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            return 0;
+        if (n == 0)
+            errno = EIO;
+        session->write_failed = 1;
+        return -1;
+    }
+
+    session->write_off = 0;
+    session->write_len = 0;
+    return 1;
 }
 
 /* ---------------------------------------------------------------------------*/
@@ -441,6 +556,8 @@ void pty_session_close(PtySession *session) {
         close(session->master_fd);
         session->master_fd = -1;
     }
+    pty_session_clear_write_buffer(session);
+    session->write_failed = 0;
 
     if (session->child_pid <= 0) return;
 
