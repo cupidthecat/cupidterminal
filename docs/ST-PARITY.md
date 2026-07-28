@@ -26,6 +26,7 @@ Deliberate Cupid extensions:
 - Runtime zoom shortcuts and per-row dirty rendering.
 - Nonblocking PTY writes with an ordered backpressure queue.
 
-The installed terminal name is `cupidterminal-256color`. Its terminfo source
-starts from `st.info`; capabilities are added only when the parser and X11
-input/output paths implement them.
+The default terminal name is `st-256color`, matching upstream st and avoiding
+an unknown `TERM` when running directly from the build tree. The bundled
+`cupidterminal-256color` terminfo source starts from `st.info`; capabilities
+are added only when the parser and X11 input/output paths implement them.

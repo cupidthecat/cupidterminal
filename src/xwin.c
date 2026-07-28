@@ -1619,11 +1619,6 @@ void send_mouse_report(int pty_fd, int event_type, int button, int col, int row,
     }
 }
 
-static void tty_write(int fd, const char *data, size_t len) {
-    (void)fd;  /* fd unused: user input routes through ttywrite/g_pty_session */
-    ttywrite(data, len, 1);
-}
-
 static int mouseaction(XEvent *e, unsigned int release) {
     const MouseShortcut *ms;
     unsigned int state = e->xbutton.state & ~(Button1Mask | Button2Mask | Button3Mask);
@@ -1646,7 +1641,7 @@ int handle_mouse_shortcut(XEvent *event, int pty_fd) {
 
 void handle_keypress(Display *display, Window window, XEvent *event, int pty_fd) {
     char buffer[128];
-    KeySym keysym;
+    KeySym keysym = NoSymbol;
     int len;
     unsigned int state;
     Status xim_status;
@@ -1658,18 +1653,10 @@ void handle_keypress(Display *display, Window window, XEvent *event, int pty_fd)
     }
 
     if (g_xic) {
-        keysym = NoSymbol;
-        len = XmbLookupString(g_xic, &event->xkey, buffer, sizeof(buffer)-1, &keysym, &xim_status);
-        if (len < 0) len = 0;
-        buffer[len] = '\0';
-        switch (xim_status) {
-        case XLookupNone:    return;
-        case XBufferOverflow: len = 0; keysym = XLookupKeysym(&event->xkey, 0); break;
-        case XLookupChars:   keysym = XLookupKeysym(&event->xkey, 0); break;
-        case XLookupKeySym:
-        case XLookupBoth:    break;
-        default:             keysym = XLookupKeysym(&event->xkey, 0); break;
-        }
+        len = XmbLookupString(g_xic, &event->xkey, buffer, sizeof(buffer),
+                              &keysym, &xim_status);
+        if (xim_status == XBufferOverflow)
+            return;
     } else {
         len = XLookupString(&event->xkey, buffer, sizeof(buffer), &keysym, NULL);
     }
@@ -1701,61 +1688,10 @@ void handle_keypress(Display *display, Window window, XEvent *event, int pty_fd)
         }
     }
 
-    if (keysym == XK_Up || keysym == XK_Down || keysym == XK_Left || keysym == XK_Right) {
-        unsigned int st = event->xkey.state;
-        int mod = 0;
-        if (st & ShiftMask)   mod |= 1;
-        if (st & Mod1Mask)    mod |= 2;
-        if (st & ControlMask) mod |= 4;
-        if (mod > 0) mod += 1;
-
-        char buf[16];
-        const char *seq;
-        size_t seqlen;
-        if (term.application_cursor_keys) {
-            static const char *app[] = {"\x1bOA","\x1bOB","\x1bOC","\x1bOD"};
-            static const char app_char[] = {'A','B','C','D'};
-            int idx = (keysym==XK_Up)?0:(keysym==XK_Down)?1:(keysym==XK_Left)?3:2;
-            if (mod > 0) { seqlen=(size_t)snprintf(buf,sizeof(buf),"\x1b[1;%d%c",mod,app_char[idx]); seq=buf; }
-            else { seq=app[idx]; seqlen=3; }
-        } else {
-            if (mod > 0) {
-                char ch=(keysym==XK_Up)?'A':(keysym==XK_Down)?'B':(keysym==XK_Left)?'D':'C';
-                seqlen=(size_t)snprintf(buf,sizeof(buf),"\x1b[1;%d%c",mod,ch); seq=buf;
-            } else {
-                static const char *norm[] = {"\x1b[A","\x1b[B","\x1b[C","\x1b[D"};
-                int idx=(keysym==XK_Up)?0:(keysym==XK_Down)?1:(keysym==XK_Left)?3:2;
-                seq=norm[idx]; seqlen=3;
-            }
-        }
-        tty_write(pty_fd, seq, seqlen);
+    if (len == 0)
         return;
-    }
 
-    else if (keysym == XK_Home)      { tty_write(pty_fd, "\x1b[H",  3); }
-    else if (keysym == XK_End)       { tty_write(pty_fd, "\x1b[F",  3); }
-    else if (keysym == XK_Page_Up)   { tty_write(pty_fd, "\x1b[5~", 4); }
-    else if (keysym == XK_Page_Down) { tty_write(pty_fd, "\x1b[6~", 4); }
-    else if (keysym == XK_Insert)    { tty_write(pty_fd, "\x1b[2~", 4); }
-    else if (keysym == XK_Delete)    { tty_write(pty_fd, "\x1b[3~", 4); }
-    else if (keysym == XK_F1)        { tty_write(pty_fd, "\x1bOP",  4); }
-    else if (keysym == XK_F2)        { tty_write(pty_fd, "\x1bOQ",  4); }
-    else if (keysym == XK_F3)        { tty_write(pty_fd, "\x1bOR",  4); }
-    else if (keysym == XK_F4)        { tty_write(pty_fd, "\x1bOS",  4); }
-    else if (keysym == XK_F5)        { tty_write(pty_fd, "\x1b[15~",5); }
-    else if (keysym == XK_F6)        { tty_write(pty_fd, "\x1b[17~",5); }
-    else if (keysym == XK_F7)        { tty_write(pty_fd, "\x1b[18~",5); }
-    else if (keysym == XK_F8)        { tty_write(pty_fd, "\x1b[19~",5); }
-    else if (keysym == XK_F9)        { tty_write(pty_fd, "\x1b[20~",5); }
-    else if (keysym == XK_F10)       { tty_write(pty_fd, "\x1b[21~",5); }
-    else if (keysym == XK_F11)       { tty_write(pty_fd, "\x1b[23~",5); }
-    else if (keysym == XK_F12)       { tty_write(pty_fd, "\x1b[24~",5); }
-
-    if (keysym == XK_BackSpace) {
-        tty_write(pty_fd, "\x7F", 1);
-    } else if (keysym == XK_Return) {
-        tty_write(pty_fd, "\r", 1);
-    } else if ((event->xkey.state & Mod1Mask) && len > 0) {
+    if (len == 1 && (state & Mod1Mask)) {
         if (term.meta_eight_bit && len == 1 &&
             (unsigned char)buffer[0] < 0x7f) {
             utf8proc_uint8_t encoded[4];
@@ -1763,15 +1699,16 @@ void handle_keypress(Display *display, Window window, XEvent *event, int pty_fd)
                 utf8proc_encode_char((utf8proc_int32_t)
                     ((unsigned char)buffer[0] | 0x80), encoded);
             if (encoded_len > 0) {
-                tty_write(pty_fd, (const char *)encoded, (size_t)encoded_len);
+                memcpy(buffer, encoded, (size_t)encoded_len);
+                len = (int)encoded_len;
             }
         } else {
-            tty_write(pty_fd, "\x1b", 1);
-            tty_write(pty_fd, buffer, (size_t)len);
+            buffer[1] = buffer[0];
+            buffer[0] = '\033';
+            len = 2;
         }
-    } else if (len > 0) {
-        tty_write(pty_fd, buffer, len);
     }
+    ttywrite(buffer, (size_t)len, 1);
 }
 
 /* win.h clipboard callbacks */

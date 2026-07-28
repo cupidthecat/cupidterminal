@@ -105,6 +105,8 @@ test-pty: $(PTY_TEST_BINS)
 
 test-x11: $(TARGET)
 	@bash test/x11/test_focus_reporting.sh
+	@bash test/x11/test_keyboard_input.sh
+	@bash test/x11/test_term_environment.sh
 
 test-manual:
 	@echo "Manual test scripts:"

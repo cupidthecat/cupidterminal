@@ -104,9 +104,12 @@ Print the selection.
 .TP
 .B TERM
 Defaults to
-.BR cupidterminal-256color .
-Install the bundled terminfo entry with
-.BR "make install" .
+.BR st-256color ,
+matching upstream st. The bundled
+.B cupidterminal-256color
+entry is also installed by
+.BR "make install"
+for customized builds.
 .TP
 .B WINDOWID
 Set to the terminal's X11 window ID before the child process starts.
