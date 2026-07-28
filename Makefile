@@ -24,7 +24,7 @@ SCREEN_TEST_BINS := $(patsubst test/screen/%.c,$(TEST_BIN_DIR)/screen_%,$(SCREEN
 UTF8_TEST_BINS := $(patsubst test/utf8/%.c,$(TEST_BIN_DIR)/utf8_%,$(UTF8_TEST_SRCS))
 PTY_TEST_BINS := $(patsubst test/pty/%.c,$(TEST_BIN_DIR)/pty_%,$(PTY_TEST_SRCS))
 
-.PHONY: all clean test test-all test-parser test-screen test-utf8 test-pty test-manual install install-terminfo check-no-x11
+.PHONY: all clean test test-all test-parser test-screen test-utf8 test-pty test-x11 test-manual install install-terminfo check-no-x11
 
 PREFIX ?= /usr/local
 BINDIR = $(PREFIX)/bin
@@ -102,6 +102,9 @@ test-utf8: $(UTF8_TEST_BINS)
 
 test-pty: $(PTY_TEST_BINS)
 	@set -e; for t in $(PTY_TEST_BINS); do echo "Running $$t"; "$$t"; done
+
+test-x11: $(TARGET)
+	@bash test/x11/test_focus_reporting.sh
 
 test-manual:
 	@echo "Manual test scripts:"

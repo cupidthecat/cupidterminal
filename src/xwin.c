@@ -4,6 +4,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
+#include <X11/XKBlib.h>
 #include <X11/Xutil.h>
 #include <X11/Xft/Xft.h>
 #include <utf8proc.h>
@@ -66,6 +67,7 @@ static Pixmap back_pixmap = None;
 static XftDraw *xft_draw_buf = NULL;
 static int back_w = 0, back_h = 0;
 static PtySession *g_x_session = NULL;
+static int window_focused = 0;
 
 static XIM g_xim = NULL;
 XIC g_xic = NULL;
@@ -1056,7 +1058,14 @@ void draw_text(Display *display, Window window, GC gc) {
         cy_top = baseline0 + cur_row * (g_cell_h + line_gap) - xft_font->ascent;
         cursor_bg_color = get_xft_color(display, window, cursor_bg_idx, 1, 0);
 
-        if (shape >= 3 && shape <= 4) {
+        if (!window_focused) {
+            XftDrawRect(draw, cursor_bg_color, cur_x, cy_top, (unsigned int)cur_w, 1);
+            XftDrawRect(draw, cursor_bg_color, cur_x, cy_top, 1, (unsigned int)cur_h);
+            XftDrawRect(draw, cursor_bg_color, cur_x + cur_w - 1, cy_top,
+                        1, (unsigned int)cur_h);
+            XftDrawRect(draw, cursor_bg_color, cur_x, cy_top + cur_h - 1,
+                        (unsigned int)cur_w, 1);
+        } else if (shape >= 3 && shape <= 4) {
             int uh = (int)cursorthickness; if (uh < 1) uh = 1;
             XftDrawRect(draw, cursor_bg_color, cur_x, cy_top + g_cell_h - uh, cur_w, uh);
         } else if (shape >= 5 && shape <= 6) {
@@ -1131,7 +1140,40 @@ void xy_to_cell(int x, int y, int *row, int *col) {
 /* ======================================================================== */
 
 void xbell(void) {
-    if (global_display) XBell(global_display, 0);
+    XWMHints *hints;
+
+    if (!global_display || !global_window)
+        return;
+    if (!window_focused) {
+        hints = XGetWMHints(global_display, global_window);
+        if (!hints)
+            hints = XAllocWMHints();
+        if (hints) {
+            hints->flags |= XUrgencyHint;
+            XSetWMHints(global_display, global_window, hints);
+            XFree(hints);
+        }
+    }
+    if (bellvolume)
+        XkbBell(global_display, global_window, bellvolume, None);
+}
+
+static void xseturgency(int urgent) {
+    XWMHints *hints;
+
+    if (!global_display || !global_window)
+        return;
+    hints = XGetWMHints(global_display, global_window);
+    if (!hints)
+        hints = XAllocWMHints();
+    if (!hints)
+        return;
+    if (urgent)
+        hints->flags |= XUrgencyHint;
+    else
+        hints->flags &= ~XUrgencyHint;
+    XSetWMHints(global_display, global_window, hints);
+    XFree(hints);
 }
 
 static void set_utf8_window_property(char *p, int icon) {
@@ -2176,10 +2218,17 @@ void run(void) {
                     }
                 }
             } else if (event.type == FocusIn) {
+                if (event.xfocus.mode == NotifyGrab)
+                    continue;
+                window_focused = 1;
+                xseturgency(0);
                 xim_focus_in();
                 if (term.focus_mode && g_x_session->master_fd >= 0)
                     (void)pty_session_write(g_x_session, "\033[I", 3);
             } else if (event.type == FocusOut) {
+                if (event.xfocus.mode == NotifyGrab)
+                    continue;
+                window_focused = 0;
                 xim_focus_out();
                 if (term.focus_mode && g_x_session->master_fd >= 0)
                     (void)pty_session_write(g_x_session, "\033[O", 3);
@@ -2189,15 +2238,12 @@ void run(void) {
                 if (event.xclient.message_type == XA_XEMBED &&
                     event.xclient.format == 32 &&
                     event.xclient.data.l[1] == XEMBED_FOCUS_IN) {
-                    xim_focus_in();
-                    if (term.focus_mode && g_x_session->master_fd >= 0)
-                        (void)pty_session_write(g_x_session, "\033[I", 3);
+                    window_focused = 1;
+                    xseturgency(0);
                 } else if (event.xclient.message_type == XA_XEMBED &&
                            event.xclient.format == 32 &&
                            event.xclient.data.l[1] == XEMBED_FOCUS_OUT) {
-                    xim_focus_out();
-                    if (term.focus_mode && g_x_session->master_fd >= 0)
-                        (void)pty_session_write(g_x_session, "\033[O", 3);
+                    window_focused = 0;
                 } else if (event.xclient.message_type == wm_protocols &&
                     (Atom)event.xclient.data.l[0] == wm_delete) {
                     pty_session_close(g_x_session);

@@ -1,13 +1,20 @@
 # st parity boundary
 
-cupidterminal is derived from the bundled st checkout at commit
-`04ce0d6f06e6552dcbb3a1643a346f5e803cd23f` (st 0.9.3 plus the upstream
+cupidterminal is derived from upstream st commit
+`04ce0d643ed17793803e8516f4c9a5b13b93c400` (st 0.9.3 plus the upstream
 zero-row and async-signal-safety fixes).
 
-The bundled source is the reference for PTY lifecycle, escape modes, X11
+That pinned upstream source is the reference for PTY lifecycle, escape modes, X11
 selection behavior, keyboard mappings, window hints, command-line options,
 terminfo, and licensing. Direct ports should preserve that behavior unless
 this document records a deliberate extension.
+
+The source is intentionally not vendored. Reproduce it with:
+
+```sh
+git clone https://git.suckless.org/st st-reference
+git -C st-reference checkout 04ce0d643ed17793803e8516f4c9a5b13b93c400
+```
 
 Deliberate Cupid extensions:
 

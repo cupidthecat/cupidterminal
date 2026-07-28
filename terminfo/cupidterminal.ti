@@ -1,6 +1,7 @@
 # cupidterminal terminfo
 #
-# Derived from the st 0.9.3 st.info entry bundled with this repository.
+# Derived from st 0.9.3 st.info at commit
+# 04ce0d643ed17793803e8516f4c9a5b13b93c400.
 # Extended names require tic -x.
 
 cupidterminal-mono|cupidterminal monocolor,
@@ -39,8 +40,10 @@ cupidterminal-mono|cupidterminal monocolor,
 	el1=\E[1K,
 	enacs=\E)0,
 	flash=\E[?5h$<80/>\E[?5l,
+	fsl=^G,
 	home=\E[H,
 	hpa=\E[%i%p1%dG,
+	hs,
 	ht=^I,
 	hts=\EH,
 	ich=\E[%p1%d@,
@@ -181,6 +184,7 @@ cupidterminal-mono|cupidterminal monocolor,
 	smso=\E[7m,
 	smul=\E[4m,
 	tbc=\E[3g,
+	tsl=\E]0;,
 	vpa=\E[%i%p1%dd,
 	xenl,
 	rmxx=\E[29m,
@@ -228,3 +232,13 @@ cupidterminal-meta-256color|cupidterminal with meta key and 256 colors,
 	smm=\E[?1034h,
 	rs2=\E[4l\E>\E[?1034h,
 	is2=\E[4l\E>\E[?1034h,
+
+cupidterminal-bs|cupidterminal with backspace as backspace,
+	use=cupidterminal,
+	kbs=\010,
+	kdch1=\177,
+
+cupidterminal-bs-256color|cupidterminal with backspace as backspace and 256 colors,
+	use=cupidterminal-256color,
+	kbs=\010,
+	kdch1=\177,

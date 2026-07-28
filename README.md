@@ -1,10 +1,18 @@
 # cupidterminal
 
 cupidterminal is a minimalist X11 terminal emulator derived from suckless
-**st**. The bundled st checkout at commit
-`04ce0d6f06e6552dcbb3a1643a346f5e803cd23f` is the behavioral reference.
+**st**. Upstream st commit
+`04ce0d643ed17793803e8516f4c9a5b13b93c400` is the behavioral reference.
 Cupid keeps that terminal contract while separating terminal logic from X11
 and adding scrollback, combining-mark storage, and font fallback.
+
+The st source is not vendored in this repository. To reproduce the reference
+checkout:
+
+```bash
+git clone https://git.suckless.org/st st-reference
+git -C st-reference checkout 04ce0d643ed17793803e8516f4c9a5b13b93c400
+```
 
 ![preview](img/term.png)
 
@@ -48,7 +56,7 @@ and adding scrollback, combining-mark storage, and font fallback.
 
 - **UTF-8 throughout.** Input from PTY, output via Xft. Multi-byte sequences split across reads are buffered and resumed across calls (no partial cluster lost at a read boundary).
 - **Wide glyphs.** CJK and emoji occupy a lead cell (`ATTR_WIDE`) and a trailing dummy cell (`ATTR_WDUMMY`); cursor advances by 2; selection across wide cells preserves the full glyph.
-- **Combining marks.** Base + diacritics render as one cluster in one cell. Multiple combining marks chain. Selection round-trips the full cluster bytes via `term_render_cluster()`.
+- **Combining marks.** Base + diacritics render as one cluster in one cell. Multiple combining marks chain. Selection and scrollback rendering round-trip the full cluster through the visual-line cluster API.
 
 ### Selection and clipboard
 
@@ -63,7 +71,7 @@ and adding scrollback, combining-mark storage, and font fallback.
 
 - **2000-line history ring buffer.** Lines pushed out of the live screen are retained until the buffer wraps.
 - **Scrollback offset.** Per-screen offset; live bottom is offset 0. Visual rows are resolved at render time via `tgetline()` so the renderer is unaware of the live / history split.
-- **Scrolls reset on input.** Typing or PTY output snaps back to the live bottom (configurable via `scroll` setting).
+- **Input resets scrollback.** Typing snaps back to the live bottom. Incoming PTY output preserves the current history viewport so output does not pull you away from what you are reading.
 
 ### Mouse
 
@@ -208,6 +216,7 @@ make test-parser   # CSI / OSC / control-char / SGR / charset coverage
 make test-screen   # cell model, scroll, wrap, selection, combining marks, wide glyphs
 make test-utf8     # multi-byte handling
 make test-pty      # PTY spawn / reap behavior
+make test-x11      # native focus reports under Xvfb
 ```
 
 Tests use the harness in `test/common/test_common.{c,h}` and link against a `cupid.c` built with `-DCUPID_NO_MAIN`.
@@ -230,6 +239,6 @@ PRs welcome. Keep changes minimal and focused, run `make test` before submitting
 
 ## Acknowledgements
 
-Derived from **suckless st** and maintained with the bundled source as the
-runtime compatibility reference. See `docs/ST-PARITY.md` for the pinned
+Derived from **suckless st** and maintained against the pinned upstream source
+as the runtime compatibility reference. See `docs/ST-PARITY.md` for the exact
 revision and deliberate Cupid extensions.
