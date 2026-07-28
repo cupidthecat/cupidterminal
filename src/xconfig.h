@@ -69,6 +69,9 @@ void zoomreset(const Arg *);
 void sendbreak(const Arg *);
 void numlock(const Arg *);
 void ttysend(const Arg *);
+void toggleprinter(const Arg *);
+void printscreen(const Arg *);
+void printsel(const Arg *);
 
 /* Config array sizes */
 #define LEN(a) (sizeof(a) / sizeof(a)[0])
@@ -84,11 +87,16 @@ void ttysend(const Arg *);
 static MouseShortcut mshortcuts[] __attribute__((unused)) = {
 	{ XK_ANY_MOD,   2, selpaste, {.i = 0}, 1 },
 	{ ShiftMask,    4, ttysend,  {.s = "\033[5;2~"}, 0 },
+	{ XK_ANY_MOD,   4, ttysend,  {.s = "\031"}, 0 },
 	{ ShiftMask,    5, ttysend,  {.s = "\033[6;2~"}, 0 },
+	{ XK_ANY_MOD,   5, ttysend,  {.s = "\005"}, 0 },
 };
 
 static Shortcut shortcuts[] __attribute__((unused)) = {
 	{ XK_ANY_MOD,     XK_Break,       sendbreak,   {.i = 0} },
+	{ ControlMask,    XK_Print,       toggleprinter,{.i = 0} },
+	{ ShiftMask,      XK_Print,       printscreen, {.i = 0} },
+	{ XK_ANY_MOD,     XK_Print,       printsel,    {.i = 0} },
 	{ TERMMOD,        XK_Prior,       zoom,        {.f = +1} },
 	{ TERMMOD,        XK_Next,        zoom,        {.f = -1} },
 	{ TERMMOD,        XK_Home,        zoomreset,   {.f = 0} },
@@ -309,6 +317,29 @@ static Key key[] __attribute__((unused)) = {
 	{ XK_F12,           ControlMask,    "\033[24;5~",    0,    0},
 	{ XK_F12,           Mod4Mask,       "\033[24;6~",    0,    0},
 	{ XK_F12,           Mod1Mask,       "\033[24;3~",    0,    0},
+	{ XK_F13,           XK_NO_MOD,      "\033[1;2P",     0,    0},
+	{ XK_F14,           XK_NO_MOD,      "\033[1;2Q",     0,    0},
+	{ XK_F15,           XK_NO_MOD,      "\033[1;2R",     0,    0},
+	{ XK_F16,           XK_NO_MOD,      "\033[1;2S",     0,    0},
+	{ XK_F17,           XK_NO_MOD,      "\033[15;2~",    0,    0},
+	{ XK_F18,           XK_NO_MOD,      "\033[17;2~",    0,    0},
+	{ XK_F19,           XK_NO_MOD,      "\033[18;2~",    0,    0},
+	{ XK_F20,           XK_NO_MOD,      "\033[19;2~",    0,    0},
+	{ XK_F21,           XK_NO_MOD,      "\033[20;2~",    0,    0},
+	{ XK_F22,           XK_NO_MOD,      "\033[21;2~",    0,    0},
+	{ XK_F23,           XK_NO_MOD,      "\033[23;2~",    0,    0},
+	{ XK_F24,           XK_NO_MOD,      "\033[24;2~",    0,    0},
+	{ XK_F25,           XK_NO_MOD,      "\033[1;5P",     0,    0},
+	{ XK_F26,           XK_NO_MOD,      "\033[1;5Q",     0,    0},
+	{ XK_F27,           XK_NO_MOD,      "\033[1;5R",     0,    0},
+	{ XK_F28,           XK_NO_MOD,      "\033[1;5S",     0,    0},
+	{ XK_F29,           XK_NO_MOD,      "\033[15;5~",    0,    0},
+	{ XK_F30,           XK_NO_MOD,      "\033[17;5~",    0,    0},
+	{ XK_F31,           XK_NO_MOD,      "\033[18;5~",    0,    0},
+	{ XK_F32,           XK_NO_MOD,      "\033[19;5~",    0,    0},
+	{ XK_F33,           XK_NO_MOD,      "\033[20;5~",    0,    0},
+	{ XK_F34,           XK_NO_MOD,      "\033[21;5~",    0,    0},
+	{ XK_F35,           XK_NO_MOD,      "\033[23;5~",    0,    0},
 };
 
 /*

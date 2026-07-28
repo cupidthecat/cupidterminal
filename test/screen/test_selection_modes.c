@@ -1,36 +1,8 @@
 /*
- * Regression-lock test: selection state machine across four modes.
- * (Phase 0.5 — st architectural alignment plan)
+ * Regression-lock test: selection state across four modes.
  *
- * READBACK API SEARCH RESULTS
- * ---------------------------
- * Functions searched for (in src/terminal_state.c, src/terminal_state.h,
- * src/draw.c, src/input.c):
- *   get_selection_text, get_selected_text, selection_to_string,
- *   clipboard_get_selection, selection_text
- *
- * Conclusion: NO dedicated selection-readback function exists in
- * terminal_state.c or terminal_state.h. The text-extraction logic lives
- * entirely in src/input.c — specifically in copy_to_clipboard() (lines
- * 336-378) which calls selection_get_effective_bounds() and walks
- * term_lines to build a malloc'd string, then passes it to
- * clipboard_set_data() which stores it in a static g_clip_data buffer.
- * The only public accessor is clipboard_get_data() (src/input.h:15).
- *
- * WHY THE FALLBACK IS USED
- * ------------------------
- * Screen tests are linked as:
- *   gcc  test/screen/%.c  build/test_common.o  build/terminal_state.o
- * Only terminal_state.o is linked — input.c (which contains
- * selection_get_effective_bounds, copy_to_clipboard, clipboard_get_data,
- * and the SNAP_WORD / SNAP_LINE / SEL_* #defines) is NOT linked.
- * Linking input.o would pull in X11/Xlib symbols that are not available
- * in the headless test environment and would violate the constraint of
- * not modifying the Makefile.
- *
- * FALLBACK STRATEGY
- * -----------------
- * Directly set term.sel_* fields and assert that:
+ * The test links the active X11-free selection model in cupid.c. It directly
+ * sets term.sel_* fields and asserts that:
  *   1. The fields can be written and read back without crashing.
  *   2. The encoded values match the documented semantics:
  *        sel_type 0 = SEL_REGULAR, 1 = SEL_RECTANGULAR
@@ -46,12 +18,16 @@
 
 #include "../common/test_common.h"
 
-/* Mirror the constants from src/input.c (not exported via any header). */
+/* SNAP_NONE is the only selection constant not exported by cupid.h. */
+#ifndef SEL_REGULAR
 #define SEL_REGULAR    0
 #define SEL_RECTANGULAR 1
+#endif
 #define SNAP_NONE      0
+#ifndef SNAP_WORD
 #define SNAP_WORD      1
 #define SNAP_LINE      2
+#endif
 
 int main(void) {
 

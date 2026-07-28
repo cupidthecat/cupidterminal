@@ -1,6 +1,6 @@
 /*
  * Charset and ACS mode behavior regression tests.
- * Ensures text mode is not corrupted by unsupported ISO-2022 shifts.
+ * Ensures the four st-compatible ISO-2022 charset slots switch cleanly.
  */
 #include "../common/test_common.h"
 
@@ -14,18 +14,18 @@ int main(void) {
     test_assert_cell(0, 1, "o", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
     test_assert_mode("gl_after_si", term.gl, 0);
 
-    /* ESC n/o (LS2/LS3) are unsupported here and must not switch to G1/ACS. */
+    /* ESC n/o select G2/G3; undesignated slots remain ASCII. */
     test_reset_terminal(2, 8);
     test_feed_string("\x1b)0\x1bn");
     test_feed_string("o");
     test_assert_cell(0, 0, "o", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
-    test_assert_mode("gl_after_esc_n", term.gl, 0);
+    test_assert_mode("gl_after_esc_n", term.gl, 2);
 
     test_reset_terminal(2, 8);
     test_feed_string("\x1b)0\x1bo");
     test_feed_string("q");
     test_assert_cell(0, 0, "q", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
-    test_assert_mode("gl_after_esc_o", term.gl, 0);
+    test_assert_mode("gl_after_esc_o", term.gl, 3);
 
     test_print_ok("parser/charset_acs");
     return 0;

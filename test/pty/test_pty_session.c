@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,6 +27,122 @@ static void sleep_10ms(void) {
     ts.tv_sec = 0;
     ts.tv_nsec = 10 * 1000 * 1000;
     nanosleep(&ts, NULL);
+}
+
+static void test_nonblocking_backpressure(void) {
+    static const char payload[] = "queued-after-backpressure";
+    PtySession queued = { .master_fd = -1, .child_pid = -1 };
+    char fill[4096];
+    char out[sizeof(payload)] = {0};
+    int pipefd[2];
+    size_t used = 0;
+
+    memset(fill, 'x', sizeof(fill));
+    if (pipe(pipefd) == -1)
+        die("pipe");
+    if (fcntl(pipefd[0], F_SETFL, O_NONBLOCK) == -1 ||
+        fcntl(pipefd[1], F_SETFL, O_NONBLOCK) == -1)
+        die("fcntl pipe O_NONBLOCK");
+
+    for (;;) {
+        ssize_t n = write(pipefd[1], fill, sizeof(fill));
+        if (n > 0)
+            continue;
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            break;
+        die("fill pipe");
+    }
+
+    queued.master_fd = pipefd[1];
+    if (pty_session_write(&queued, payload, sizeof(payload) - 1) !=
+        (ssize_t)(sizeof(payload) - 1)) {
+        fprintf(stderr, "TEST FAILURE: backpressured write was not queued\n");
+        exit(EXIT_FAILURE);
+    }
+    if (!pty_session_wants_write(&queued)) {
+        fprintf(stderr, "TEST FAILURE: queued write readiness was not exposed\n");
+        exit(EXIT_FAILURE);
+    }
+
+    for (;;) {
+        ssize_t n = read(pipefd[0], fill, sizeof(fill));
+        if (n > 0)
+            continue;
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            break;
+        die("drain fill");
+    }
+
+    while (pty_session_wants_write(&queued)) {
+        if (pty_session_flush(&queued) < 0)
+            die("pty_session_flush");
+        for (;;) {
+            ssize_t n = read(pipefd[0], out + used, sizeof(out) - 1 - used);
+            if (n > 0) {
+                used += (size_t)n;
+                continue;
+            }
+            if (n < 0 && errno == EINTR)
+                continue;
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                break;
+            if (n == 0)
+                break;
+            die("read queued payload");
+        }
+    }
+
+    if (used != sizeof(payload) - 1 ||
+        memcmp(out, payload, sizeof(payload) - 1) != 0) {
+        fprintf(stderr, "TEST FAILURE: queued payload was truncated or reordered\n");
+        exit(EXIT_FAILURE);
+    }
+
+    pty_session_close(&queued);
+    close(pipefd[0]);
+}
+
+static void test_queue_limit(void) {
+    PtySession capped = { .master_fd = -1, .child_pid = -1 };
+    unsigned char *oversized;
+    char fill[4096];
+    int pipefd[2];
+
+    memset(fill, 'x', sizeof(fill));
+    if (pipe(pipefd) == -1)
+        die("pipe queue limit");
+    if (fcntl(pipefd[1], F_SETFL, O_NONBLOCK) == -1)
+        die("fcntl queue limit O_NONBLOCK");
+    for (;;) {
+        ssize_t n = write(pipefd[1], fill, sizeof(fill));
+        if (n > 0)
+            continue;
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            break;
+        die("fill queue-limit pipe");
+    }
+
+    oversized = malloc(PTY_WRITE_QUEUE_LIMIT + 1u);
+    if (!oversized)
+        die("malloc oversized queue test");
+    memset(oversized, 'q', PTY_WRITE_QUEUE_LIMIT + 1u);
+    capped.master_fd = pipefd[1];
+    errno = 0;
+    if (pty_session_write(&capped, oversized, PTY_WRITE_QUEUE_LIMIT + 1u) != -1 ||
+        errno != ENOBUFS) {
+        fprintf(stderr, "TEST FAILURE: PTY write queue limit was not enforced\n");
+        exit(EXIT_FAILURE);
+    }
+
+    free(oversized);
+    pty_session_close(&capped);
+    close(pipefd[0]);
 }
 
 int main(void) {
@@ -127,6 +244,8 @@ int main(void) {
         return EXIT_FAILURE;
     }
 
+    test_nonblocking_backpressure();
+    test_queue_limit();
     printf("PASS: pty/session_basic\n");
     return 0;
 }

@@ -5,7 +5,7 @@ int main(void) {
     test_feed_string("ABCDE");
     test_assert_cursor(0, 5);
     test_feed_string("F");
-    test_assert_cell(0, 4, "E", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
+    test_assert_cell(0, 4, "E", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, ATTR_WRAP);
     test_assert_cell(1, 0, "F", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
     test_assert_cursor(1, 1);
 
@@ -33,7 +33,7 @@ int main(void) {
     test_reset_terminal(2, 5);
     test_feed_string("ABCDEFGHIJK");
     test_assert_cell(0, 0, "F", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
-    test_assert_cell(0, 4, "J", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
+    test_assert_cell(0, 4, "J", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, ATTR_WRAP);
     test_assert_cell(1, 0, "K", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
     test_assert_cursor(1, 1);
 

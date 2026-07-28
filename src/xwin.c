@@ -1,9 +1,10 @@
 /* See LICENSE for license details. */
 /* xwin.c: X11/Xft layer, event loop, keymap dispatch, clipboard, mouse-to-selection. */
 
-#define _POSIX_C_SOURCE 199309L
+#define _POSIX_C_SOURCE 200809L
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
+#include <X11/XKBlib.h>
 #include <X11/Xutil.h>
 #include <X11/Xft/Xft.h>
 #include <utf8proc.h>
@@ -32,6 +33,8 @@
 #define DRAW_TOP_PAD  5
 
 #define MAX_LINES 100
+#define XEMBED_FOCUS_IN  4
+#define XEMBED_FOCUS_OUT 5
 
 int line_count = 0;
 
@@ -63,6 +66,8 @@ int g_cell_gap = 0;
 static Pixmap back_pixmap = None;
 static XftDraw *xft_draw_buf = NULL;
 static int back_w = 0, back_h = 0;
+static PtySession *g_x_session = NULL;
+static int window_focused = 0;
 
 static XIM g_xim = NULL;
 XIC g_xic = NULL;
@@ -860,26 +865,11 @@ static void resolve_cell_colors(uint32_t in_fg, uint32_t in_bg, uint16_t mode, i
 static int draw_full_refresh = 1;
 static int prev_cursor_row = -1;
 
-/* Phase 3.6: encode cluster for rendering into out[cap].
-   live_row >= 0: index into term_lines[] — uses term_render_cluster for full
-   cluster (base + combining marks from side-channel).
-   live_row < 0: history / scrollback row — only base codepoint is available.
-   Returns bytes written (NUL not counted), 0 for empty/error. */
-static size_t encode_render_cluster(int live_row, int col, const Glyph *cell,
+/* Encode the cluster shown at a visual row, including scrollback marks. */
+static size_t encode_render_cluster(int visual_row, int col, const Glyph *cell,
                                     char *out, size_t cap) {
-    if (!out || cap == 0) return 0;
-    if (live_row >= 0) {
-        return term_render_cluster(live_row, col, out, cap);
-    }
-    /* History / scrollback: encode base codepoint only */
-    if (cell->u == 0) { out[0] = '\0'; return 0; }
-    utf8proc_uint8_t buf[4];
-    utf8proc_ssize_t r = utf8proc_encode_char((utf8proc_int32_t)cell->u, buf);
-    if (r <= 0 || (size_t)r >= cap) { out[0] = '\0'; return 0; }
-    size_t n = (size_t)r;
-    for (size_t i = 0; i < n; i++) out[i] = (char)buf[i];
-    out[n] = '\0';
-    return n;
+    (void)cell;
+    return term_render_visual_cluster(visual_row, col, out, cap);
 }
 
 void draw_text(Display *display, Window window, GC gc) {
@@ -950,11 +940,6 @@ void draw_text(Display *display, Window window, GC gc) {
         if (!full && term_lines && !term_lines[r].dirty) continue;
         if (!row_cells) continue;
 
-        /* live_row >= 0 means this visual row maps directly to term_lines[live_row].
-           History rows (scrollback) have live_row == -1; combining marks not available. */
-        int live_row = (scrollback_offset <= 0) ? r
-                     : (r >= scrollback_offset ? r - scrollback_offset : -1);
-
         int x = LEFT_PAD;
         int y = baseline0 + r * (g_cell_h + line_gap);
         int row_top = y - xft_font->ascent;
@@ -972,7 +957,8 @@ void draw_text(Display *display, Window window, GC gc) {
                     const Glyph *cell = &row_cells[c];
                     if (cell->mode & ATTR_WDUMMY) { cur_px += step_w; continue; }
                     int cell_span = ((cell->mode & ATTR_WIDE) && c+1 < term_cols) ? 2 : 1;
-                    int is_sel = selected(r,c) || (cell_span==2 && selected(r,c+1));
+                    int is_sel = selected(c, r) ||
+                                 (cell_span == 2 && selected(c + 1, r));
                     uint32_t fg_val, bg_val;
                     resolve_cell_colors(cell->fg, cell->bg, cell->mode, is_sel, blink_hidden, &fg_val, &bg_val);
                     bg_color = get_xft_color(display, window, bg_val, 1, 0);
@@ -1004,14 +990,15 @@ void draw_text(Display *display, Window window, GC gc) {
                 if (cell->mode & ATTR_WDUMMY) { x += step_w; continue; }
                 if ((cell->mode & ATTR_WIDE) && c+1 < term_cols) cell_span = 2;
 
-                is_sel = selected(r,c) || (cell_span==2 && selected(r,c+1));
+                is_sel = selected(c, r) ||
+                         (cell_span == 2 && selected(c + 1, r));
                 resolve_cell_colors(cell->fg, cell->bg, cell->mode, is_sel, blink_hidden, &fg_val, &bg_val);
                 draw_w = g_cell_w * cell_span;
                 fg_color = get_xft_color(display, window, fg_val, 0, (cell->mode & ATTR_FAINT) != 0);
 
                 {
-                    char cluster[64];
-                    size_t cluster_len = encode_render_cluster(live_row, c, cell, cluster, sizeof cluster);
+                    char cluster[MAX_CLUSTER_UTF8];
+                    size_t cluster_len = encode_render_cluster(r, c, cell, cluster, sizeof cluster);
                     if (cluster_len > 0) {
                         utf8proc_int32_t cp;
                         ssize_t rs = utf8proc_iterate((const uint8_t *)cluster, (utf8proc_ssize_t)cluster_len, &cp);
@@ -1038,7 +1025,8 @@ void draw_text(Display *display, Window window, GC gc) {
     }
 
     /* Cursor */
-    if (term.cursor_visible && show_cursor) {
+    if (term.cursor_visible && show_cursor && term_lines &&
+        term_rows > 0 && term_cols > 0) {
         int cur_row = term.row, cur_col = term.col, cur_span = 1;
         int is_sel;
         uint32_t cursor_fg_idx, cursor_bg_idx;
@@ -1057,7 +1045,8 @@ void draw_text(Display *display, Window window, GC gc) {
         cursor_cell = &term_lines[cur_row].line[cur_col];
         cursor_attrs = cursor_cell->mode & (ATTR_BOLD | ATTR_ITALIC | ATTR_UNDERLINE | ATTR_STRUCK);
         if ((cursor_cell->mode & ATTR_WIDE) && cur_col+1 < term_cols) cur_span = 2;
-        is_sel = selected(cur_row,cur_col) || (cur_span==2 && selected(cur_row,cur_col+1));
+        is_sel = selected(cur_col, cur_row) ||
+                 (cur_span == 2 && selected(cur_col + 1, cur_row));
 
         if (term.screen_reverse) {
             cursor_bg_idx = is_sel ? defaultcs : defaultrcs;
@@ -1072,7 +1061,14 @@ void draw_text(Display *display, Window window, GC gc) {
         cy_top = baseline0 + cur_row * (g_cell_h + line_gap) - xft_font->ascent;
         cursor_bg_color = get_xft_color(display, window, cursor_bg_idx, 1, 0);
 
-        if (shape >= 3 && shape <= 4) {
+        if (!window_focused) {
+            XftDrawRect(draw, cursor_bg_color, cur_x, cy_top, (unsigned int)cur_w, 1);
+            XftDrawRect(draw, cursor_bg_color, cur_x, cy_top, 1, (unsigned int)cur_h);
+            XftDrawRect(draw, cursor_bg_color, cur_x + cur_w - 1, cy_top,
+                        1, (unsigned int)cur_h);
+            XftDrawRect(draw, cursor_bg_color, cur_x, cy_top + cur_h - 1,
+                        (unsigned int)cur_w, 1);
+        } else if (shape >= 3 && shape <= 4) {
             int uh = (int)cursorthickness; if (uh < 1) uh = 1;
             XftDrawRect(draw, cursor_bg_color, cur_x, cy_top + g_cell_h - uh, cur_w, uh);
         } else if (shape >= 5 && shape <= 6) {
@@ -1094,7 +1090,7 @@ void draw_text(Display *display, Window window, GC gc) {
                                   (const FcChar8 *)snowman, 3);
                 XftDrawSetClip(draw, NULL);
             } else {
-                char cursor_cluster[64];
+                char cursor_cluster[MAX_CLUSTER_UTF8];
                 size_t cursor_cluster_len = term_render_cluster(cur_row, cur_col, cursor_cluster, sizeof cursor_cluster);
                 if (cursor_cluster_len > 0) {
                     utf8proc_int32_t cp;
@@ -1147,17 +1143,79 @@ void xy_to_cell(int x, int y, int *row, int *col) {
 /* ======================================================================== */
 
 void xbell(void) {
-    if (global_display) XBell(global_display, 0);
+    XWMHints *hints;
+
+    if (!global_display || !global_window)
+        return;
+    if (!window_focused) {
+        hints = XGetWMHints(global_display, global_window);
+        if (!hints)
+            hints = XAllocWMHints();
+        if (hints) {
+            hints->flags |= XUrgencyHint;
+            XSetWMHints(global_display, global_window, hints);
+            XFree(hints);
+        }
+    }
+    if (bellvolume)
+        XkbBell(global_display, global_window, bellvolume, None);
+}
+
+static void xseturgency(int urgent) {
+    XWMHints *hints;
+
+    if (!global_display || !global_window)
+        return;
+    hints = XGetWMHints(global_display, global_window);
+    if (!hints)
+        hints = XAllocWMHints();
+    if (!hints)
+        return;
+    if (urgent)
+        hints->flags |= XUrgencyHint;
+    else
+        hints->flags &= ~XUrgencyHint;
+    XSetWMHints(global_display, global_window, hints);
+    XFree(hints);
+}
+
+static void set_utf8_window_property(char *p, int icon) {
+    XTextProperty prop;
+    char *list[] = { p };
+    Atom net_property;
+
+    if (!p || !global_display || !global_window)
+        return;
+
+    if (Xutf8TextListToTextProperty(global_display, list, 1,
+                                    XUTF8StringStyle, &prop) == Success) {
+        if (icon)
+            XSetWMIconName(global_display, global_window, &prop);
+        else
+            XSetWMName(global_display, global_window, &prop);
+        net_property = XInternAtom(global_display,
+            icon ? "_NET_WM_ICON_NAME" : "_NET_WM_NAME", False);
+        XSetTextProperty(global_display, global_window, &prop, net_property);
+        XFree(prop.value);
+    } else if (icon) {
+        XSetIconName(global_display, global_window, p);
+    } else {
+        XStoreName(global_display, global_window, p);
+    }
 }
 
 void xsettitle(char *p) {
-    if (p && global_display && global_window)
-        XStoreName(global_display, global_window, p);
+    extern char *opt_title;
+    if (!p)
+        p = (opt_title && opt_title[0]) ? opt_title : "cupidterminal";
+    set_utf8_window_property(p, 0);
 }
 
 void xseticontitle(char *p) {
-    if (p && global_display && global_window)
-        XSetIconName(global_display, global_window, p);
+    extern char *opt_title;
+    if (!p)
+        p = (opt_title && opt_title[0]) ? opt_title : "cupidterminal";
+    set_utf8_window_property(p, 1);
 }
 
 void xstartdraw(void) {
@@ -1198,6 +1256,30 @@ int xsetcolorname(int x, const char *name) {
     (void)x; (void)name;
     /* UNUSED: st.c has no caller. Color name overrides are not yet wired;
        colors are resolved at draw time by draw_text(). */
+    return 0;
+}
+
+int xparsecolor(const char *name, uint32_t *color) {
+    XColor parsed;
+
+    if (!global_display || !name || !color ||
+        !XParseColor(global_display,
+                     DefaultColormap(global_display, DefaultScreen(global_display)),
+                     name, &parsed))
+        return -1;
+    *color = TRUECOLOR(parsed.red >> 8, parsed.green >> 8, parsed.blue >> 8);
+    return 0;
+}
+
+int xgetcolor(int x, uint8_t *r, uint8_t *g, uint8_t *b) {
+    XRenderColor color;
+
+    if (!r || !g || !b || x < 0)
+        return -1;
+    color = get_xrender_color((uint32_t)x, x == (int)defaultbg, 0);
+    *r = (uint8_t)(color.red >> 8);
+    *g = (uint8_t)(color.green >> 8);
+    *b = (uint8_t)(color.blue >> 8);
     return 0;
 }
 
@@ -1247,12 +1329,17 @@ void copy_to_clipboard(Display *display, Window window);
 #define TIMEDIFF_MS(t1, t2) \
     (((t1).tv_sec - (t2).tv_sec) * 1000 + ((t1).tv_nsec - (t2).tv_nsec) / 1000000)
 
+static unsigned char *g_primary_data = NULL;
 static unsigned char *g_clip_data = NULL;
 static struct timespec g_tclick1;
 static struct timespec g_tclick2;
+static size_t g_primary_len = 0;
 static size_t g_clip_len = 0;
 static int g_pty_fd = -1;
-static int g_numlock = 0;
+static int g_numlock = 1;
+static int g_paste_incr = 0;
+static int g_paste_started = 0;
+static Atom g_paste_property = None;
 
 void input_set_pty_fd(int fd) { g_pty_fd = fd; }
 
@@ -1269,8 +1356,9 @@ static const char *kmap(KeySym k, unsigned int state) {
     for (kp = key; kp < key + LEN(key); kp++) {
         if (kp->k != k) continue;
         if (!match(kp->mask, state)) continue;
-        if (kp->appcursor && (term.application_cursor_keys ? kp->appcursor < 0 : kp->appcursor > 0)) continue;
+        if (term.application_keypad ? kp->appkey < 0 : kp->appkey > 0) continue;
         if (kp->appkey && g_numlock && kp->appkey == 2) continue;
+        if (kp->appcursor && (term.application_cursor_keys ? kp->appcursor < 0 : kp->appcursor > 0)) continue;
         return kp->s;
     }
     return NULL;
@@ -1286,7 +1374,12 @@ void clippaste(const Arg *arg) {
 }
 void selpaste(const Arg *arg) {
     (void)arg;
-    if (global_display && global_window) paste_from_clipboard(global_display, global_window);
+    if (global_display && global_window) {
+        Atom utf8 = XInternAtom(global_display, "UTF8_STRING", False);
+        XDeleteProperty(global_display, global_window, XA_PRIMARY);
+        XConvertSelection(global_display, XA_PRIMARY, utf8, XA_PRIMARY,
+                          global_window, CurrentTime);
+    }
 }
 void zoom(const Arg *arg) {
     if (global_display && global_window)
@@ -1302,18 +1395,17 @@ void sendbreak(const Arg *arg) {
     if (g_pty_fd >= 0) tcsendbreak(g_pty_fd, 0);
 }
 void numlock(const Arg *arg) { (void)arg; g_numlock ^= 1; }
+void toggleprinter(const Arg *arg) { (void)arg; tprinter_toggle(); }
+void printscreen(const Arg *arg) { (void)arg; tprinter_screen(); }
+void printsel(const Arg *arg) { (void)arg; tprinter_selection(); }
 
 /* tty_write_all: raw fd write for protocol responses (mouse, focus).
    No echo, no lnm expansion — used only for terminal → host direction. */
 static void tty_write_all(int fd, const uint8_t *data, size_t len) {
-    size_t sent = 0;
     if (fd < 0 || !data || len == 0) return;
-    while (sent < len) {
-        ssize_t rc = write(fd, data + sent, len - sent);
-        if (rc > 0)                   { sent += (size_t)rc; continue; }
-        if (rc < 0 && errno == EINTR) continue;
-        break;
-    }
+    if (g_x_session && g_x_session->master_fd == fd &&
+        pty_session_write(g_x_session, data, len) < 0)
+        perror("write error on tty");
 }
 
 void ttysend(const Arg *arg) {
@@ -1350,10 +1442,19 @@ void selection_release(Display *display, Window window, int col, int row) {
     selrelease(col, row);
     text = getsel();
     if (text) {
-        clipboard_set_data(display, window, (const uint8_t *)text, strlen(text));
+        size_t len = strlen(text);
+        unsigned char *copy = malloc(len + 1);
+        if (copy) {
+            memcpy(copy, text, len + 1);
+            free(g_primary_data);
+            g_primary_data = copy;
+            g_primary_len = len;
+            XSetSelectionOwner(display, XA_PRIMARY, window, CurrentTime);
+            if (XGetSelectionOwner(display, XA_PRIMARY) != window)
+                selclear();
+        }
         free(text);
     }
-    selclear();
 }
 
 const unsigned char *clipboard_get_data(size_t *len_out) {
@@ -1362,63 +1463,130 @@ const unsigned char *clipboard_get_data(size_t *len_out) {
 }
 
 void clipboard_set_data(Display *display, Window window, const uint8_t *data, size_t len) {
-    Atom clipboard, primary;
+    Atom clipboard;
     unsigned char *copy;
 
     free(g_clip_data); g_clip_data = NULL; g_clip_len = 0;
-    if (!display || !window || !data || len == 0) return;
+    if (!display || !window || !data) return;
 
-    copy = malloc(len);
+    copy = malloc(len + 1);
     if (!copy) return;
     memcpy(copy, data, len);
+    copy[len] = '\0';
     g_clip_data = copy; g_clip_len = len;
 
     clipboard = XInternAtom(display, "CLIPBOARD", False);
-    primary = XA_PRIMARY;
     XSetSelectionOwner(display, clipboard, window, CurrentTime);
-    XSetSelectionOwner(display, primary, window, CurrentTime);
 }
 
 void copy_to_clipboard(Display *display, Window window) {
-    char *text = getsel();
-    if (text) {
-        clipboard_set_data(display, window, (const uint8_t *)text, strlen(text));
-        free(text);
-    }
+    if (g_primary_data)
+        clipboard_set_data(display, window, g_primary_data, g_primary_len);
 }
 
 void paste_from_clipboard(Display *display, Window window) {
     Atom clipboard   = XInternAtom(display, "CLIPBOARD", False);
     Atom utf8_string = XInternAtom(display, "UTF8_STRING", False);
-    Atom xsel_data   = XInternAtom(display, "XSEL_DATA", False);
-    XConvertSelection(display, clipboard, utf8_string, xsel_data, window, CurrentTime);
+    XDeleteProperty(display, window, clipboard);
+    XConvertSelection(display, clipboard, utf8_string, clipboard, window, CurrentTime);
+}
+
+static void paste_chunk(unsigned char *data, size_t len) {
+    unsigned char *newline;
+    unsigned char *end;
+
+    if (!data || len == 0)
+        return;
+    newline = data;
+    end = data + len;
+    while ((newline = memchr(newline, '\n', (size_t)(end - newline))) != NULL)
+        *newline++ = '\r';
+    if (term.bracketed_paste_mode && !g_paste_started) {
+        ttywrite("\033[200~", 6, 0);
+        g_paste_started = 1;
+    }
+    ttywrite((const char *)data, len, 1);
+}
+
+static void finish_paste(void) {
+    if (term.bracketed_paste_mode && g_paste_started)
+        ttywrite("\033[201~", 6, 0);
+    g_paste_started = 0;
 }
 
 void handle_paste_event(Display *display, Window window, XEvent *event, int pty_fd) {
-    if (event->type != SelectionNotify) return;
-    Atom utf8_string = XInternAtom(display, "UTF8_STRING", False);
-    Atom xsel_data   = XInternAtom(display, "XSEL_DATA", False);
+    Atom incr = XInternAtom(display, "INCR", False);
+    Atom property = None;
+    unsigned long offset = 0;
+    unsigned long nitems;
+    unsigned long bytes_after;
     Atom actual_type;
     int actual_format;
-    unsigned long nitems, bytes_after;
     unsigned char *data = NULL;
 
-    XGetWindowProperty(display, window, xsel_data, 0, 1<<20, False, utf8_string,
-                       &actual_type, &actual_format, &nitems, &bytes_after, &data);
-
-    if (data) {
-        size_t payload_cap = (size_t)nitems + 16;
-        uint8_t *payload = malloc(payload_cap);
-        if (payload) {
-            size_t payload_len = tpastefmt((const uint8_t *)data, (size_t)nitems,
-                                           term.bracketed_paste_mode, payload, payload_cap);
-            if (payload_len > 0)
-                ttywrite((const char *)payload, payload_len, 1);
-            free(payload);
-        }
-        XFree(data);
-    }
     (void)pty_fd;
+    if (event->type == SelectionNotify) {
+        property = event->xselection.property;
+        g_paste_started = 0;
+    } else if (event->type == PropertyNotify &&
+               event->xproperty.state == PropertyNewValue &&
+               g_paste_incr && event->xproperty.atom == g_paste_property) {
+        property = event->xproperty.atom;
+    } else {
+        return;
+    }
+    if (property == None)
+        return;
+
+    do {
+        if (XGetWindowProperty(display, window, property, (long)offset,
+                               BUFSIZ / 4, False, AnyPropertyType,
+                               &actual_type, &actual_format, &nitems,
+                               &bytes_after, &data) != Success) {
+            fprintf(stderr, "cupidterminal: clipboard property read failed\n");
+            finish_paste();
+            g_paste_incr = 0;
+            return;
+        }
+
+        if (actual_type == incr) {
+            XFree(data);
+            g_paste_incr = 1;
+            g_paste_property = property;
+            XDeleteProperty(display, window, property);
+            XFlush(display);
+            return;
+        }
+
+        if (actual_format != 0 && actual_format != 8) {
+            XFree(data);
+            finish_paste();
+            g_paste_incr = 0;
+            XDeleteProperty(display, window, property);
+            return;
+        }
+
+        if (nitems > 0)
+            paste_chunk(data, (size_t)nitems * (size_t)actual_format / 8);
+        XFree(data);
+        data = NULL;
+
+        if (actual_format > 0)
+            offset += nitems * (unsigned long)actual_format / 32;
+    } while (bytes_after > 0);
+
+    if (g_paste_incr) {
+        if (nitems == 0) {
+            finish_paste();
+            g_paste_incr = 0;
+            g_paste_property = None;
+        }
+        XDeleteProperty(display, window, property);
+        XFlush(display);
+    } else {
+        finish_paste();
+        XDeleteProperty(display, window, property);
+    }
 }
 
 void send_mouse_report(int pty_fd, int event_type, int button, int col, int row,
@@ -1484,6 +1652,10 @@ void handle_keypress(Display *display, Window window, XEvent *event, int pty_fd)
     Status xim_status;
 
     (void)display; (void)window;
+
+    if (term.keyboard_lock) {
+        return;
+    }
 
     if (g_xic) {
         keysym = NoSymbol;
@@ -1584,8 +1756,19 @@ void handle_keypress(Display *display, Window window, XEvent *event, int pty_fd)
     } else if (keysym == XK_Return) {
         tty_write(pty_fd, "\r", 1);
     } else if ((event->xkey.state & Mod1Mask) && len > 0) {
-        tty_write(pty_fd, "\x1b", 1);
-        tty_write(pty_fd, buffer, len);
+        if (term.meta_eight_bit && len == 1 &&
+            (unsigned char)buffer[0] < 0x7f) {
+            utf8proc_uint8_t encoded[4];
+            utf8proc_ssize_t encoded_len =
+                utf8proc_encode_char((utf8proc_int32_t)
+                    ((unsigned char)buffer[0] | 0x80), encoded);
+            if (encoded_len > 0) {
+                tty_write(pty_fd, (const char *)encoded, (size_t)encoded_len);
+            }
+        } else {
+            tty_write(pty_fd, "\x1b", 1);
+            tty_write(pty_fd, buffer, (size_t)len);
+        }
     } else if (len > 0) {
         tty_write(pty_fd, buffer, len);
     }
@@ -1594,8 +1777,20 @@ void handle_keypress(Display *display, Window window, XEvent *event, int pty_fd)
 /* win.h clipboard callbacks */
 void xsetsel(char *str) {
     if (!str || !global_display || !global_window) return;
-    clipboard_set_data(global_display, global_window,
-                       (const uint8_t *)str, strlen(str));
+    size_t len = strlen(str);
+    unsigned char *copy = malloc(len + 1);
+    if (!copy) return;
+    memcpy(copy, str, len + 1);
+    free(g_primary_data);
+    g_primary_data = copy;
+    g_primary_len = len;
+    XSetSelectionOwner(global_display, XA_PRIMARY, global_window, CurrentTime);
+    if (XGetSelectionOwner(global_display, XA_PRIMARY) != global_window) {
+        free(g_primary_data);
+        g_primary_data = NULL;
+        g_primary_len = 0;
+        selclear();
+    }
 }
 
 void xclipcopy(void) {
@@ -1637,6 +1832,7 @@ int handle_pty_output(Display *display, Window window, GC gc, PtySession *sessio
                            ? state->osc52_len : sizeof(state->osc52_buf) - 2;
                 state->osc52_buf[n] = '\0';
                 xsetsel((char *)state->osc52_buf);
+                xclipcopy();
                 state->osc52_pending = 0; state->osc52_len = 0;
             }
         } else if (num_read == 0) {
@@ -1679,30 +1875,53 @@ void sync_pty_winsize_from_window(Display *display, Window window, PtySession *s
     tresize(ws_row, ws_col);
 }
 
+void xsync_pty_winsize(PtySession *session) {
+    sync_pty_winsize_from_window(global_display, global_window, session);
+}
+
 /* ======================================================================== */
 /* xinit() + run() — X11 init and event loop (moved from main.c)           */
 /* ======================================================================== */
 
-/* Parse an X11 geometry string ("80x24+0+0") and extract just cols and rows.
-   Position (x, y) is ignored — cupidterminal doesn't honor a placement hint
-   from CLI. Falls back to current values on parse failure. */
+static int x_geometry_mask;
+static int x_geometry_x;
+static int x_geometry_y;
+
+/* Parse an st-style character geometry and retain its placement hints. */
 void parse_geometry_str(const char *geom, unsigned int *cols, unsigned int *rows) {
-    int x = 0, y = 0;
     unsigned int w = 0, h = 0;
     if (!geom || !cols || !rows) return;
-    int mask = XParseGeometry(geom, &x, &y, &w, &h);
-    if (mask & WidthValue)  *cols = w;
-    if (mask & HeightValue) *rows = h;
-    (void)x; (void)y;
+    x_geometry_mask = XParseGeometry(geom, &x_geometry_x, &x_geometry_y, &w, &h);
+    if (x_geometry_mask & WidthValue)  *cols = w;
+    if (x_geometry_mask & HeightValue) *rows = h;
 }
 
 static Display *x_display = NULL;
 static Window   x_window  = 0;
 static GC       x_gc      = 0;
-static PtySession *g_x_session = NULL;
 
 void xinit(int cols, int rows, PtySession *session) {
-    (void)cols; (void)rows;
+    XClassHint class_hint;
+    XSizeHints size_hint;
+    XWMHints wm_hint;
+    Window parent;
+    Window root;
+    int screen;
+    int win_x = x_geometry_x;
+    int win_y = x_geometry_y;
+    int win_w;
+    int win_h;
+    int step_w;
+    int step_h;
+    char window_id[32];
+    const char *title;
+
+    extern char *opt_class;
+    extern char *opt_embed;
+    extern char *opt_name;
+    extern char *opt_title;
+    extern int opt_fixed;
+
     g_x_session = session;
 
     XSetLocaleModifiers("");
@@ -1713,14 +1932,34 @@ void xinit(int cols, int rows, PtySession *session) {
         exit(EXIT_FAILURE);
     }
 
-    int screen = DefaultScreen(x_display);
-    x_window = XCreateSimpleWindow(x_display, RootWindow(x_display, screen),
-                                   0, 0, 800, 600, 1,
+    screen = DefaultScreen(x_display);
+    root = RootWindow(x_display, screen);
+    parent = root;
+    if (opt_embed && opt_embed[0]) {
+        char *end = NULL;
+        unsigned long candidate = strtoul(opt_embed, &end, 0);
+        if (!end || *end != '\0' || candidate == 0) {
+            fprintf(stderr, "cupidterminal: invalid window id: %s\n", opt_embed);
+            exit(EXIT_FAILURE);
+        }
+        parent = (Window)candidate;
+    }
+
+    x_window = XCreateSimpleWindow(x_display, root,
+                                   0, 0, 1, 1, 0,
                                    BlackPixel(x_display, screen),
                                    BlackPixel(x_display, screen));
+    if (!x_window) {
+        fprintf(stderr, "cupidterminal: could not create window\n");
+        exit(EXIT_FAILURE);
+    }
+    if (parent != root)
+        XReparentWindow(x_display, x_window, parent, 0, 0);
 
     XSetWindowBackground(x_display, x_window, BlackPixel(x_display, screen));
-    XStoreName(x_display, x_window, "cupidterminal");
+    title = (opt_title && opt_title[0]) ? opt_title : "cupidterminal";
+    XStoreName(x_display, x_window, title);
+    XSetIconName(x_display, x_window, title);
 
     {
         Atom wm_delete = XInternAtom(x_display, "WM_DELETE_WINDOW", False);
@@ -1731,10 +1970,73 @@ void xinit(int cols, int rows, PtySession *session) {
         ExposureMask | KeyPressMask | KeyReleaseMask | PropertyChangeMask |
         StructureNotifyMask | FocusChangeMask |
         ButtonPressMask | ButtonReleaseMask | PointerMotionMask);
-    XMapWindow(x_display, x_window);
     x_gc = XCreateGC(x_display, x_window, 0, NULL);
 
     initialize_xft(x_display, x_window);
+    xsettitle((char *)title);
+    xseticontitle((char *)title);
+
+    step_w = g_cell_w + g_cell_gap;
+    step_h = g_cell_h + LINE_GAP;
+    if (step_w < 1) step_w = 1;
+    if (step_h < 1) step_h = 1;
+    win_w = DRAW_LEFT_PAD + cols * step_w;
+    win_h = DRAW_TOP_PAD + rows * step_h;
+    if (x_geometry_mask & XNegative)
+        win_x += DisplayWidth(x_display, screen) - win_w;
+    if (x_geometry_mask & YNegative)
+        win_y += DisplayHeight(x_display, screen) - win_h;
+
+    memset(&size_hint, 0, sizeof(size_hint));
+    size_hint.flags = PSize | PResizeInc | PBaseSize | PMinSize;
+    size_hint.width = win_w;
+    size_hint.height = win_h;
+    size_hint.width_inc = step_w;
+    size_hint.height_inc = step_h;
+    size_hint.base_width = DRAW_LEFT_PAD;
+    size_hint.base_height = DRAW_TOP_PAD;
+    size_hint.min_width = DRAW_LEFT_PAD + step_w;
+    size_hint.min_height = DRAW_TOP_PAD + step_h;
+    if (opt_fixed) {
+        size_hint.flags |= PMaxSize;
+        size_hint.min_width = size_hint.max_width = win_w;
+        size_hint.min_height = size_hint.max_height = win_h;
+    }
+    if (x_geometry_mask & (XValue | YValue)) {
+        size_hint.flags |= USPosition | PWinGravity;
+        size_hint.x = win_x;
+        size_hint.y = win_y;
+        size_hint.win_gravity =
+            (x_geometry_mask & XNegative)
+                ? ((x_geometry_mask & YNegative) ? SouthEastGravity : NorthEastGravity)
+                : ((x_geometry_mask & YNegative) ? SouthWestGravity : NorthWestGravity);
+    }
+
+    memset(&wm_hint, 0, sizeof(wm_hint));
+    wm_hint.flags = InputHint;
+    wm_hint.input = True;
+    class_hint.res_name = (opt_name && opt_name[0]) ? opt_name : termname;
+    class_hint.res_class = (opt_class && opt_class[0]) ? opt_class : termname;
+    XSetWMProperties(x_display, x_window, NULL, NULL, NULL, 0,
+                     &size_hint, &wm_hint, &class_hint);
+
+    {
+        Atom net_wm_pid = XInternAtom(x_display, "_NET_WM_PID", False);
+        long pid = (long)getpid();
+        XChangeProperty(x_display, x_window, net_wm_pid, XA_CARDINAL, 32,
+                        PropModeReplace, (unsigned char *)&pid, 1);
+    }
+
+    XMoveResizeWindow(x_display, x_window, win_x, win_y,
+                      (unsigned int)win_w, (unsigned int)win_h);
+    XMapWindow(x_display, x_window);
+    XSync(x_display, False);
+
+    snprintf(window_id, sizeof(window_id), "%lu", (unsigned long)x_window);
+    if (setenv("WINDOWID", window_id, 1) == -1) {
+        perror("setenv WINDOWID");
+        exit(EXIT_FAILURE);
+    }
 
     {
         XWindowAttributes wa_init;
@@ -1742,15 +2044,17 @@ void xinit(int cols, int rows, PtySession *session) {
             draw_notify_resize(wa_init.width, wa_init.height);
     }
 
-    sync_pty_winsize_from_window(x_display, x_window, session);
+    if (session && session->master_fd >= 0)
+        sync_pty_winsize_from_window(x_display, x_window, session);
 }
 
 void run(void) {
     XEvent event;
-    fd_set fds;
+    fd_set fds, wfds;
     Atom XA_UTF8    = XInternAtom(x_display, "UTF8_STRING", False);
     Atom XA_TEXT    = XInternAtom(x_display, "TEXT", False);
     Atom XA_TARGETS = XInternAtom(x_display, "TARGETS", False);
+    Atom XA_XEMBED  = XInternAtom(x_display, "_XEMBED", False);
 
     int drawing = 0;
     struct timespec trigger = {0, 0};
@@ -1765,12 +2069,15 @@ void run(void) {
         if (!pty_session_child_alive(g_x_session)) break;
 
         FD_ZERO(&fds);
+        FD_ZERO(&wfds);
         x11_fd = ConnectionNumber(x_display);
         FD_SET(x11_fd, &fds);
         nfds = x11_fd + 1;
 
         if (g_x_session->master_fd >= 0) {
             FD_SET(g_x_session->master_fd, &fds);
+            if (pty_session_wants_write(g_x_session))
+                FD_SET(g_x_session->master_fd, &wfds);
             if (g_x_session->master_fd >= nfds) nfds = g_x_session->master_fd + 1;
         }
 
@@ -1791,7 +2098,7 @@ void run(void) {
             tv_ptr = &tv;
         }
 
-        ready = select(nfds, &fds, NULL, NULL, tv_ptr);
+        ready = select(nfds, &fds, &wfds, NULL, tv_ptr);
         if (ready < 0) {
             if (errno == EINTR) continue;
             perror("select failed");
@@ -1800,6 +2107,14 @@ void run(void) {
 
         clock_gettime(CLOCK_MONOTONIC, &now);
         int had_input = 0;
+
+        if (ready > 0 && g_x_session->master_fd >= 0 &&
+            FD_ISSET(g_x_session->master_fd, &wfds)) {
+            if (pty_session_flush(g_x_session) < 0) {
+                perror("write error on tty");
+                break;
+            }
+        }
 
         if (ready > 0 && g_x_session->master_fd >= 0 && FD_ISSET(g_x_session->master_fd, &fds)) {
             had_input = 1;
@@ -1820,28 +2135,63 @@ void run(void) {
                 /* draw deferred */
             } else if (event.type == SelectionNotify) {
                 handle_paste_event(x_display, x_window, &event, g_x_session->master_fd);
+            } else if (event.type == PropertyNotify) {
+                handle_paste_event(x_display, x_window, &event, g_x_session->master_fd);
+            } else if (event.type == SelectionClear) {
+                Atom clipboard = XInternAtom(x_display, "CLIPBOARD", False);
+                if (event.xselectionclear.selection == XA_PRIMARY) {
+                    free(g_primary_data);
+                    g_primary_data = NULL;
+                    g_primary_len = 0;
+                    selclear();
+                } else if (event.xselectionclear.selection == clipboard) {
+                    free(g_clip_data);
+                    g_clip_data = NULL;
+                    g_clip_len = 0;
+                }
             } else if (event.type == ConfigureNotify) {
                 draw_notify_resize(event.xconfigure.width, event.xconfigure.height);
                 sync_pty_winsize_from_window(x_display, x_window, g_x_session);
             } else if (event.type == ButtonPress || event.type == ButtonRelease ||
                        event.type == MotionNotify) {
-                if (handle_mouse_shortcut(&event, g_x_session->master_fd)) {
+                unsigned int event_state = event.type == MotionNotify
+                    ? event.xmotion.state : event.xbutton.state;
+                int mouse_active = term.mouse_reporting_x10 ||
+                    term.mouse_reporting_basic ||
+                    term.mouse_reporting_button || term.mouse_reporting_any;
+                int app_mouse_event = mouse_active &&
+                    g_x_session->master_fd >= 0 &&
+                    !(event_state & forcemousemod);
+                int cupid_scrollback_wheel =
+                    event.type == ButtonPress && !term.alt_screen_active &&
+                    !mouse_active && !(event_state & forcemousemod) &&
+                    (event.xbutton.button == Button4 ||
+                     event.xbutton.button == Button5);
+
+                if (!app_mouse_event && !cupid_scrollback_wheel &&
+                    handle_mouse_shortcut(&event, g_x_session->master_fd)) {
                     /* handled */
                 } else {
-                    int mouse_active = term.mouse_reporting_basic ||
-                        term.mouse_reporting_button || term.mouse_reporting_any;
-                    if (mouse_active && g_x_session->master_fd >= 0 &&
-                        !(event.xbutton.state & ShiftMask)) {
+                    if (app_mouse_event) {
                         int r=0, c=0, btn=0, evt=-1;
                         unsigned int mods=0;
                         if (event.type == ButtonPress) {
                             xy_to_cell(event.xbutton.x, event.xbutton.y, &r, &c);
                             btn=event.xbutton.button; mods=event.xbutton.state; evt=0;
                         } else if (event.type == ButtonRelease) {
+                            if (term.mouse_reporting_x10) {
+                                evt = -1;
+                                btn = 0;
+                            } else {
                             xy_to_cell(event.xbutton.x, event.xbutton.y, &r, &c);
                             btn=event.xbutton.button; mods=event.xbutton.state;
                             if (btn==4||btn==5) evt=-1; else evt=1;
+                            }
                         } else {
+                            if (term.mouse_reporting_x10) {
+                                evt = -1;
+                                btn = 0;
+                            } else {
                             xy_to_cell(event.xmotion.x, event.xmotion.y, &r, &c);
                             mods=event.xmotion.state;
                             if (term.mouse_reporting_any) { evt=2; btn=12; }
@@ -1850,7 +2200,10 @@ void run(void) {
                                 evt=2;
                                 btn=(mods&Button1Mask)?1:(mods&Button2Mask)?2:3;
                             }
+                            }
                         }
+                        if (term.mouse_reporting_x10)
+                            mods = 0;
                         if (evt>=0 && btn>=1 && btn<=12)
                             send_mouse_report(g_x_session->master_fd, evt, btn,
                                 c+1, r+1, mods, term.mouse_sgr_mode);
@@ -1874,17 +2227,33 @@ void run(void) {
                     }
                 }
             } else if (event.type == FocusIn) {
+                if (event.xfocus.mode == NotifyGrab)
+                    continue;
+                window_focused = 1;
+                xseturgency(0);
                 xim_focus_in();
                 if (term.focus_mode && g_x_session->master_fd >= 0)
                     (void)pty_session_write(g_x_session, "\033[I", 3);
             } else if (event.type == FocusOut) {
+                if (event.xfocus.mode == NotifyGrab)
+                    continue;
+                window_focused = 0;
                 xim_focus_out();
                 if (term.focus_mode && g_x_session->master_fd >= 0)
                     (void)pty_session_write(g_x_session, "\033[O", 3);
             } else if (event.type == ClientMessage) {
                 Atom wm_protocols = XInternAtom(x_display, "WM_PROTOCOLS", False);
                 Atom wm_delete    = XInternAtom(x_display, "WM_DELETE_WINDOW", False);
-                if (event.xclient.message_type == wm_protocols &&
+                if (event.xclient.message_type == XA_XEMBED &&
+                    event.xclient.format == 32 &&
+                    event.xclient.data.l[1] == XEMBED_FOCUS_IN) {
+                    window_focused = 1;
+                    xseturgency(0);
+                } else if (event.xclient.message_type == XA_XEMBED &&
+                           event.xclient.format == 32 &&
+                           event.xclient.data.l[1] == XEMBED_FOCUS_OUT) {
+                    window_focused = 0;
+                } else if (event.xclient.message_type == wm_protocols &&
                     (Atom)event.xclient.data.l[0] == wm_delete) {
                     pty_session_close(g_x_session);
                     cleanup_xft();
@@ -1893,34 +2262,44 @@ void run(void) {
                 }
             } else if (event.type == SelectionRequest) {
                 XSelectionRequestEvent *req = &event.xselectionrequest;
+                Atom property = (req->property == None) ? req->target : req->property;
                 XSelectionEvent ev = {
                     .type=SelectionNotify, .display=req->display,
                     .requestor=req->requestor, .selection=req->selection,
-                    .target=req->target, .property=req->property, .time=req->time
+                    .target=req->target, .property=None, .time=req->time
                 };
                 size_t len = 0;
-                const unsigned char *data = clipboard_get_data(&len);
+                const unsigned char *data = NULL;
+                Atom clipboard = XInternAtom(x_display, "CLIPBOARD", False);
+                if (req->selection == XA_PRIMARY) {
+                    data = g_primary_data;
+                    len = g_primary_len;
+                } else if (req->selection == clipboard) {
+                    data = clipboard_get_data(&len);
+                }
                 if (!data) {
-                    ev.property = None;
                     XSendEvent(x_display, req->requestor, True, 0, (XEvent*)&ev);
                     XFlush(x_display);
                     continue;
                 }
                 if (req->target == XA_TARGETS) {
                     Atom targets[4] = {XA_UTF8, XA_TEXT, XA_STRING, XA_TARGETS};
-                    XChangeProperty(x_display, req->requestor, req->property, XA_ATOM, 32,
+                    XChangeProperty(x_display, req->requestor, property, XA_ATOM, 32,
                                     PropModeReplace, (unsigned char*)targets, 4);
+                    ev.property = property;
                 } else if (req->target==XA_UTF8 || req->target==XA_TEXT || req->target==XA_STRING) {
                     Atom type = (req->target==XA_STRING) ? XA_STRING : XA_UTF8;
-                    XChangeProperty(x_display, req->requestor, req->property, type, 8,
+                    XChangeProperty(x_display, req->requestor, property, type, 8,
                                     PropModeReplace, (unsigned char*)data, (int)len);
-                } else {
-                    ev.property = None;
+                    ev.property = property;
                 }
                 XSendEvent(x_display, req->requestor, True, 0, (XEvent*)&ev);
                 XFlush(x_display);
             }
         }
+
+        if (g_x_session->write_failed)
+            break;
 
         /* Draw latency */
         if (had_input) {

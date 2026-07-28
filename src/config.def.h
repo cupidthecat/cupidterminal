@@ -29,7 +29,7 @@
  *
  * font: see http://freedesktop.org/software/fontconfig/fontconfig-user.html
  */
-static char *font __attribute__((unused)) = "undefined medium:pixelsize=12:antialias=true:autohint=true";
+static char *font __attribute__((unused)) = "Liberation Mono:pixelsize=12:antialias=true:autohint=true";
 extern char *opt_font;
 static int borderpx __attribute__((unused)) = 2;
 extern double usedfontsize;
@@ -92,7 +92,7 @@ static int bellvolume __attribute__((unused)) = 0;
 extern char *termname;
 
 /* Shell and execution */
-static char *shell __attribute__((unused)) = "/bin/bash";
+static char *shell __attribute__((unused)) = "/bin/sh";
 extern char *utmp;
 extern char *scroll;
 extern char *stty_args;

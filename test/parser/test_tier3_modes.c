@@ -24,13 +24,13 @@ int main(void) {
 
     test_feed_string("\x1b[?1049h");
     test_assert_mode("alt_screen_active", term.alt_screen_active, 1);
-    test_assert_cursor(0, 0);
+    test_assert_cursor(1, 3);
     test_assert_cell(0, 0, "", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
 
     test_feed_string("ALT");
-    test_assert_cell(0, 0, "A", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
-    test_assert_cell(0, 1, "L", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
-    test_assert_cell(0, 2, "T", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
+    test_assert_cell(1, 3, "A", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
+    test_assert_cell(1, 4, "L", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
+    test_assert_cell(1, 5, "T", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
 
     test_feed_string("\x1b[?1049l");
     test_assert_mode("alt_screen_active", term.alt_screen_active, 0);

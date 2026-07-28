@@ -5,11 +5,21 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#define PTY_WRITE_QUEUE_LIMIT (1024u * 1024u)
+
+int pty_build_stty_command(char *command, size_t capacity,
+                           const char *base, char *const extra_args[]);
+
 typedef struct {
     int master_fd;
     pid_t child_pid;
     int child_exited;
     int child_status;
+    unsigned char *write_buf;
+    size_t write_off;
+    size_t write_len;
+    size_t write_cap;
+    int write_failed;
 } PtySession;
 
 /*
@@ -33,6 +43,8 @@ int pty_session_reap_child(PtySession *session, int *status_out);
 int pty_session_child_alive(const PtySession *session);
 ssize_t pty_session_read(PtySession *session, void *buf, size_t len);
 ssize_t pty_session_write(PtySession *session, const void *buf, size_t len);
+int pty_session_wants_write(const PtySession *session);
+int pty_session_flush(PtySession *session);
 void pty_session_close(PtySession *session);
 
 /* Signal handling and child reaping (moved from main.c) */

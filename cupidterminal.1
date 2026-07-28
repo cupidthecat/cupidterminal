@@ -1,0 +1,122 @@
+.TH CUPIDTERMINAL 1 cupidterminal\-0.1
+.SH NAME
+cupidterminal \- st-compatible X11 terminal with Cupid extensions
+.SH SYNOPSIS
+.B cupidterminal
+.RB [ \-aiv ]
+.RB [ \-c
+.IR class ]
+.RB [ \-f
+.IR font ]
+.RB [ \-g
+.IR geometry ]
+.RB [ \-n
+.IR name ]
+.RB [ \-o
+.IR iofile ]
+.RB [ \-T
+.IR title ]
+.RB [ \-l
+.IR line ]
+.RB [ \-w
+.IR windowid ]
+.RB [[ \-e ]
+.IR command
+.RI [ arguments ...]]
+.SH DESCRIPTION
+.B cupidterminal
+is an X11 terminal emulator derived from st. It keeps st's command-line and
+terminal behavior while adding scrollback, combining-mark storage, and a
+separate X11-free parser module.
+.SH OPTIONS
+.TP
+.B \-a
+Disable the alternate screen.
+.TP
+.BI \-c " class"
+Set the window class (default: $TERM).
+.TP
+.BI \-f " font"
+Set the fontconfig font description.
+.TP
+.BI \-g " geometry"
+Set the character geometry and optional X11 position. The form is
+[=][<cols>x<rows>][{+-}<xoffset>{+-}<yoffset>].
+.TP
+.B \-i
+Fix the window to the size supplied by
+.BR \-g .
+.TP
+.BI \-n " name"
+Set the window instance name (default: $TERM).
+.TP
+.BI \-o " iofile"
+Record terminal output in
+.IR iofile .
+The value "-" selects standard output.
+.TP
+.BI \-T " title"
+Set the window title.
+.TP
+.BI \-t " title"
+Alias for
+.BR \-T .
+.TP
+.BI \-w " windowid"
+Embed cupidterminal in the given X11 window.
+.TP
+.BI \-l " line"
+Use a serial or pseudo-serial line instead of a new PTY. Remaining arguments
+are passed to
+.BR stty (1).
+.TP
+.B \-v
+Print the version and exit.
+.TP
+.BI \-e " command " [ " arguments " "... ]"
+Run a command instead of the shell. This must be the last option.
+.SH SHORTCUTS
+.TP
+.B Ctrl-Shift-c
+Copy the primary selection to the clipboard.
+.TP
+.B Ctrl-Shift-v
+Paste the clipboard.
+.TP
+.B Shift-Insert, Ctrl-Shift-y, middle click
+Paste the primary selection.
+.TP
+.B Ctrl-Shift-Page Up / Page Down
+Increase or decrease font size.
+.TP
+.B Ctrl-Shift-Home
+Reset the font size.
+.TP
+.B Ctrl-Print Screen
+Toggle printer output.
+.TP
+.B Shift-Print Screen
+Print the screen.
+.TP
+.B Print Screen
+Print the selection.
+.SH ENVIRONMENT
+.TP
+.B TERM
+Defaults to
+.BR cupidterminal-256color .
+Install the bundled terminfo entry with
+.BR "make install" .
+.TP
+.B WINDOWID
+Set to the terminal's X11 window ID before the child process starts.
+.SH FILES
+.TP
+.I /usr/local/share/terminfo
+Default installation location for the terminal description.
+.SH AUTHORS
+See the LICENSE file.
+.SH SEE ALSO
+.BR stty (1),
+.BR tic (1),
+.BR xterm (1)
