@@ -124,7 +124,8 @@ sudo make install
 ```
 
 `make install` installs the binary, manual page, and bundled terminfo entry.
-The child environment defaults to `TERM=cupidterminal-256color`.
+Like upstream st, the child environment defaults to `TERM=st-256color`, so a
+local `make && ./cupidterminal` works with the standard st terminfo entry.
 
 ```bash
 make install-terminfo
