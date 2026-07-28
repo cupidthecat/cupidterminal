@@ -86,7 +86,7 @@ check-no-x11:
 	fi
 	@echo "OK: src/cupid.c is X11-clean"
 
-test: check-no-x11 test-all
+test: check-no-x11 test-all test-x11
 
 test-all: test-parser test-screen test-utf8 test-pty
 	@echo "All automated test suites PASSED."

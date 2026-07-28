@@ -1785,6 +1785,12 @@ void xsetsel(char *str) {
     g_primary_data = copy;
     g_primary_len = len;
     XSetSelectionOwner(global_display, XA_PRIMARY, global_window, CurrentTime);
+    if (XGetSelectionOwner(global_display, XA_PRIMARY) != global_window) {
+        free(g_primary_data);
+        g_primary_data = NULL;
+        g_primary_len = 0;
+        selclear();
+    }
 }
 
 void xclipcopy(void) {
@@ -2155,10 +2161,10 @@ void run(void) {
                     term.mouse_reporting_button || term.mouse_reporting_any;
                 int app_mouse_event = mouse_active &&
                     g_x_session->master_fd >= 0 &&
-                    !(event_state & ShiftMask);
+                    !(event_state & forcemousemod);
                 int cupid_scrollback_wheel =
                     event.type == ButtonPress && !term.alt_screen_active &&
-                    !mouse_active && !(event_state & ShiftMask) &&
+                    !mouse_active && !(event_state & forcemousemod) &&
                     (event.xbutton.button == Button4 ||
                      event.xbutton.button == Button5);
 

@@ -74,7 +74,10 @@ int main(void) {
         "RIS must reset dynamic colors");
     test_assert_true(strcmp(test_last_title(), "cupidterminal") == 0,
         "RIS must reset the title");
-    test_feed_string("\033]4;3;#040506\a\033]104\a");
+    test_feed_string("\033]4;3;#040506\a\033]104;invalid\a");
+    test_assert_true(term.palette_overridden[3],
+        "malformed OSC 104 must be rejected without changing the palette");
+    test_feed_string("\033]104\a");
     test_assert_true(!term.palette_overridden[3],
         "OSC 104 without a parameter must reset the whole palette");
 

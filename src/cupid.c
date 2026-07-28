@@ -1604,11 +1604,15 @@ static void osc_finalize(Term *state, terminal_response_fn response_fn,
             mark_all_rows_dirty();
         } else {
             while (*p) {
-                int idx = (int)strtol(p, (char **)&p, 10);
+                char *end;
+                long idx = strtol(p, &end, 10);
+                if (end == p || (*end != '\0' && *end != ';'))
+                    break;
                 if (idx >= 0 && idx < 256) {
-                    state->palette_overridden[idx] = 0;
-                    state->palette_override[idx] = 0;
+                    state->palette_overridden[(int)idx] = 0;
+                    state->palette_override[(int)idx] = 0;
                 }
+                p = end;
                 if (*p == ';') p++;
             }
             mark_all_rows_dirty();
@@ -2443,43 +2447,15 @@ static void csihandle(const char *seq, int len, Term *state,
             r = state->row;
             max_insert = bottom - r + 1;
             if (n > max_insert) n = max_insert;
-            /*
-             * CSI L: insert n blank lines at r, shifting r..bottom-n down.
-             * Swap full TermLine structs so combs move with their rows.
-             * The n rows at bottom-n+1..bottom scroll off — their combs
-             * are freed; the line buffers are reused as the new blank rows
-             * at r..r+n-1.
-             *
-             * Strategy: rotate the range [r..bottom] downward by n slots
-             * using a temporary array of size n for the displaced rows.
-             */
-            {
-                /* Save the n rows that will scroll off (bottom-n+1..bottom). */
-                TermLine *displaced = malloc((size_t)n * sizeof(TermLine));
-                if (displaced) {
-                    for (int i = 0; i < n; i++)
-                        displaced[i] = term_lines[bottom - n + 1 + i];
-                    /* Shift rows [r .. bottom-n] down by n. */
-                    for (int row = bottom; row >= r + n; row--)
-                        term_lines[row] = term_lines[row - n];
-                    /* Put saved rows at r..r+n-1 as the new blank lines. */
-                    for (int i = 0; i < n; i++) {
-                        int row = r + i;
-                        term_lines[row] = displaced[i];
-                        free_row_combs(row);
-                        for (int c = 0; c < term_cols; c++)
-                            init_default_cell(&term_lines[row].line[c]);
-                        term_lines[row].dirty = 1;
-                    }
-                    free(displaced);
-                } else {
-                    /* OOM fallback: memcpy-only (combs may desync) */
-                    for (int row = bottom; row >= r + n; row--)
-                        memcpy(term_lines[row].line, term_lines[row - n].line,
-                               (size_t)term_cols * sizeof(Glyph));
-                    for (int row = r; row < r + n && row <= bottom; row++)
-                        clear_row_range(row, 0, term_cols - 1, state);
-                }
+            for (int i = 0; i < n; i++) {
+                TermLine displaced = term_lines[bottom];
+                for (int row = bottom; row > r; row--)
+                    term_lines[row] = term_lines[row - 1];
+                term_lines[r] = displaced;
+                free_row_combs(r);
+                for (int c = 0; c < term_cols; c++)
+                    init_default_cell(&term_lines[r].line[c]);
+                term_lines[r].dirty = 1;
             }
             mark_rows_dirty(r, bottom);
         } break;
@@ -2498,42 +2474,15 @@ static void csihandle(const char *seq, int len, Term *state,
             r = state->row;
             max_del = bottom - r + 1;
             if (n > max_del) n = max_del;
-            /*
-             * CSI M: delete n lines at r, shifting r+n..bottom up by n.
-             * Swap full TermLine structs so combs move with their rows.
-             * The n rows at r..r+n-1 scroll off — their combs are freed;
-             * the line buffers are reused as the new blank rows at
-             * bottom-n+1..bottom.
-             *
-             * Strategy: save deleted rows, shift remaining rows up, put
-             * saved rows at bottom-n+1..bottom as blank lines.
-             */
-            {
-                TermLine *displaced = malloc((size_t)n * sizeof(TermLine));
-                if (displaced) {
-                    for (int i = 0; i < n; i++)
-                        displaced[i] = term_lines[r + i];
-                    /* Shift rows [r+n .. bottom] up by n. */
-                    for (int row = r; row <= bottom - n; row++)
-                        term_lines[row] = term_lines[row + n];
-                    /* Put saved rows at bottom-n+1..bottom as blank lines. */
-                    for (int i = 0; i < n; i++) {
-                        int row = bottom - n + 1 + i;
-                        term_lines[row] = displaced[i];
-                        free_row_combs(row);
-                        for (int c = 0; c < term_cols; c++)
-                            init_default_cell(&term_lines[row].line[c]);
-                        term_lines[row].dirty = 1;
-                    }
-                    free(displaced);
-                } else {
-                    /* OOM fallback: memcpy-only (combs may desync) */
-                    for (int row = r; row <= bottom - n; row++)
-                        memcpy(term_lines[row].line, term_lines[row + n].line,
-                               (size_t)term_cols * sizeof(Glyph));
-                    for (int row = bottom - n + 1; row <= bottom; row++)
-                        clear_row_range(row, 0, term_cols - 1, state);
-                }
+            for (int i = 0; i < n; i++) {
+                TermLine displaced = term_lines[r];
+                for (int row = r; row < bottom; row++)
+                    term_lines[row] = term_lines[row + 1];
+                term_lines[bottom] = displaced;
+                free_row_combs(bottom);
+                for (int c = 0; c < term_cols; c++)
+                    init_default_cell(&term_lines[bottom].line[c]);
+                term_lines[bottom].dirty = 1;
             }
             mark_rows_dirty(r, bottom);
         } break;
