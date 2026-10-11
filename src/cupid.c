@@ -358,6 +358,8 @@ static CombMark *find_line_comb(TermLine *line, int col) {
     return NULL;
 }
 
+static void repair_wide_cells(TermLine *line, int cols, const Term *state);
+
 static void copy_line_contents(TermLine *dst, const TermLine *src,
                                int copy_cols) {
     if (!dst || !src || !dst->line || !src->line || copy_cols <= 0)
@@ -398,6 +400,7 @@ static void copy_line_contents(TermLine *dst, const TermLine *src,
                (size_t)source->n * sizeof(*target->runes));
         dst->line[target->col].mode |= ATTR_HASCOMB;
     }
+    repair_wide_cells(dst, copy_cols, NULL);
 }
 
 static TermLine *alloc_history_lines(int cols) {
@@ -517,6 +520,24 @@ static void clear_cell_at(TermLine *line, int col, const Term *state) {
     clear_cell(&line->line[col], state);
 }
 
+/* Editing or narrowing a row can remove just one half of a wide glyph. */
+static void repair_wide_cells(TermLine *line, int cols, const Term *state) {
+    for (int c = 0; c < cols; c++) {
+        uint16_t mode = line->line[c].mode;
+        int orphan = ((mode & ATTR_WIDE) &&
+                      (c + 1 == cols || !(line->line[c + 1].mode & ATTR_WDUMMY))) ||
+                     ((mode & ATTR_WDUMMY) &&
+                      (c == 0 || !(line->line[c - 1].mode & ATTR_WIDE)));
+        if (orphan) {
+            remove_line_comb(line, c);
+            if (state)
+                clear_cell(&line->line[c], state);
+            else
+                init_default_cell(&line->line[c]);
+        }
+    }
+}
+
 static void shift_line_right(TermLine *line, int from, int shift,
                              const Term *state) {
     if (!line || !line->line || shift <= 0 || from < 0 || from >= term_cols)
@@ -538,6 +559,7 @@ static void shift_line_right(TermLine *line, int from, int shift,
             (size_t)(term_cols - from - shift) * sizeof(Glyph));
     for (int col = from; col < from + shift; col++)
         clear_cell_at(line, col, state);
+    repair_wide_cells(line, term_cols, state);
 }
 
 static void shift_line_left(TermLine *line, int from, int shift,
@@ -561,6 +583,7 @@ static void shift_line_left(TermLine *line, int from, int shift,
             (size_t)(term_cols - from - shift) * sizeof(Glyph));
     for (int col = term_cols - shift; col < term_cols; col++)
         clear_cell_at(line, col, state);
+    repair_wide_cells(line, term_cols, state);
 }
 
 /*
