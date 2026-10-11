@@ -22,7 +22,7 @@
 - **Application cursor keys.** DECCKM (`?1`) switches arrow keys to SS3 sequences.
 - **Charset.** G0-G3 designation, SO / SI and LS2 / LS3 shifts. DEC Special Graphics (VT100 ACS box-drawing).
 - **Device attributes / status reports.** DA (CSI c), DSR cursor position (CSI 6n), DECID.
-- **Soft / hard reset.** DECSTR (CSI ! p), RIS (ESC c).
+- **Hard reset.** RIS (ESC c) restores terminal modes and clears the live screens. DECSTR (CSI ! p) is not implemented.
 - **Status line.** BEL (`\a`) routes to `xbell()` for one ring per character.
 
 ### Color
