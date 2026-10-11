@@ -1990,7 +1990,7 @@ void xinit(int cols, int rows, PtySession *session) {
 
 void run(void) {
     XEvent event;
-    struct pollfd fds[2];
+    struct pollfd fds[3];
     Atom XA_UTF8    = XInternAtom(x_display, "UTF8_STRING", False);
     Atom XA_TEXT    = XInternAtom(x_display, "TEXT", False);
     Atom XA_TARGETS = XInternAtom(x_display, "TARGETS", False);
@@ -2005,10 +2005,16 @@ void run(void) {
         double timeout_ms = -1, elapsed;
 
         pty_reap(g_x_session);
-        if (!pty_session_child_alive(g_x_session)) break;
+        if (!pty_session_child_alive(g_x_session)) {
+            /* Process bytes already queued before the child exited. */
+            if (g_x_session->master_fd >= 0)
+                (void)handle_pty_output(x_display, x_window, x_gc, g_x_session, &term);
+            break;
+        }
 
         fds[0] = (struct pollfd){ConnectionNumber(x_display), POLLIN, 0};
         fds[1] = (struct pollfd){g_x_session->master_fd, POLLIN, 0};
+        fds[2] = (struct pollfd){pty_signal_fd(), POLLIN, 0};
         if (pty_session_wants_write(g_x_session))
             fds[1].events |= POLLOUT;
 
@@ -2049,7 +2055,7 @@ void run(void) {
                 if (wait_ms < timeout_ms) wait_ms++;
             }
         }
-        ready = poll(fds, 2, wait_ms);
+        ready = poll(fds, 3, wait_ms);
         if (ready < 0) {
             if (errno == EINTR) continue;
             perror("poll failed");

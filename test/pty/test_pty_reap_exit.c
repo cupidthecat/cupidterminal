@@ -73,6 +73,9 @@ int main(void) {
         fail("unexpected exit status from shell child");
     }
 
+    if (pty_session_child_alive(&session))
+        fail("reaped child must not be reported as a live serial session");
+
     pty_session_close(&session);
 
     printf("PASS: pty/reap_exit_status\n");

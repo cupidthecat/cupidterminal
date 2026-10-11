@@ -49,6 +49,8 @@ void pty_session_close(PtySession *session);
 
 /* Signal handling and child reaping (moved from main.c) */
 void pty_install_signal_handlers(void);
+/* Readable after SIGCHLD, including signals delivered before poll begins. */
+int pty_signal_fd(void);
 void pty_reap(PtySession *session);
 
 #endif /* PTY_H */

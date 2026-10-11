@@ -34,11 +34,24 @@ extern char *stty_args;   /* stty argument string for serial-line mode    */
  * Signal handling (moved from main.c)
  * ---------------------------------------------------------------------------*/
 static volatile sig_atomic_t g_sigchld_pending = 0;
+static int sigchld_pipe[2] = {-1, -1};
 
 /* SIGWINCH: no-op; we rely on ConfigureNotify for X11 resize. */
 static void handle_resize(int sig) { (void)sig; }
 
-static void handle_sigchld(int sig) { (void)sig; g_sigchld_pending = 1; }
+static void handle_sigchld(int sig) {
+    int saved_errno = errno;
+    unsigned char byte = 1;
+    (void)sig;
+    g_sigchld_pending = 1;
+    if (sigchld_pipe[1] >= 0)
+        (void)write(sigchld_pipe[1], &byte, sizeof byte);
+    errno = saved_errno;
+}
+
+int pty_signal_fd(void) {
+    return sigchld_pipe[0];
+}
 
 /*
  * pty_reap – drain all exited children.
@@ -48,6 +61,10 @@ void pty_reap(PtySession *session) {
     int rc;
     if (!g_sigchld_pending) return;
     g_sigchld_pending = 0;
+    if (sigchld_pipe[0] >= 0) {
+        unsigned char bytes[64];
+        while (read(sigchld_pipe[0], bytes, sizeof bytes) > 0) {}
+    }
     do {
         rc = pty_session_reap_child(session, NULL);
     } while (rc == 1);
@@ -59,6 +76,10 @@ void pty_reap(PtySession *session) {
  */
 void pty_install_signal_handlers(void) {
     struct sigaction sa;
+    if (sigchld_pipe[0] < 0 && pipe2(sigchld_pipe, O_CLOEXEC | O_NONBLOCK) < 0) {
+        perror("pipe SIGCHLD");
+        exit(EXIT_FAILURE);
+    }
     sa.sa_handler = handle_sigchld;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_NOCLDSTOP;
@@ -572,7 +593,7 @@ int pty_session_reap_child(PtySession *session, int *status_out) {
 int pty_session_child_alive(const PtySession *session) {
     /* In serial-line mode child_pid is -1; the "session" lives while the fd is open */
     if (!session) return 0;
-    if (session->master_fd < 0) return 0;
+    if (session->master_fd < 0 || session->child_exited) return 0;
     if (session->child_pid < 0) return 1; /* serial mode: fd open = alive */
     return !session->child_exited;
 }
