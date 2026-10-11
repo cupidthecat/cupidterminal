@@ -103,7 +103,9 @@ static void printer_mirror_input(const uint8_t *bytes, size_t len, int enabled,
         if (p < final && bytes[p] >= '0' && bytes[p] <= '9') {
             param = 0;
             while (p < final && bytes[p] >= '0' && bytes[p] <= '9') {
-                param = param * 10 + (bytes[p] - '0');
+                int digit = bytes[p] - '0';
+                param = param > (INT_MAX - digit) / 10
+                    ? INT_MAX : param * 10 + digit;
                 p++;
             }
         }
