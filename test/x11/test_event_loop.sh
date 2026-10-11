@@ -32,6 +32,22 @@ wait_window() {
     echo "TEST FAILURE: $title did not map" >&2
     return 1
 }
+"${CC:-cc}" -Wall -Wextra -Werror -std=c99 -fPIC -shared test/x11/count_copies.c -o "$test_dir/count_copies.so" -ldl
+CUPID_COPY_COUNT="$test_dir/copies" LD_PRELOAD="$test_dir/count_copies.so" ./cupidterminal -g 20x4 -e sh -c 'printf "\033[?25lIDLE\033]2;cupid-idle-redraw\007"; sleep 15' >"$test_dir/terminal.log" 2>&1 &
+terminal_pid=$!
+win=$(wait_window cupid-idle-redraw)
+sleep 0.5
+before=$(wc -c <"$test_dir/copies")
+sleep 1.5
+after=$(wc -c <"$test_dir/copies")
+if (( after - before > 10 )); then
+    echo "TEST FAILURE: idle terminal redrew $((after - before)) times" >&2
+    idle_failed=1
+else
+    echo 'PASS: x11/idle_redraw'
+fi
+kill "$terminal_pid"; wait "$terminal_pid" || true
+terminal_pid=
 "${CC:-cc}" -Wall -Wextra -Werror -std=c99 test/x11/blink_pixels.c -o "$test_dir/blink_pixels" -lX11
 ./cupidterminal -g 20x4 -e sh -c 'printf "\033[?25l\033[5mBLINK\033[0m\033]2;cupid-idle-blink\007"; sleep 15' >"$test_dir/terminal.log" 2>&1 &
 terminal_pid=$!
@@ -64,4 +80,4 @@ wait "$terminal_pid"
 terminal_pid=
 [[ $(cat "$test_dir/keys") == x ]]
 echo 'PASS: x11/high_descriptors'
-[[ ${blink_failed:-0} == 0 ]]
+[[ ${blink_failed:-0} == 0 && ${idle_failed:-0} == 0 ]]
