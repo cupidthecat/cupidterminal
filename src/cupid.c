@@ -1358,12 +1358,25 @@ static void wrap_to_next_line(Term *state) {
     advance_row_with_scroll(state);
 }
 
+/* A UTF-8 continuation byte can have the same value as 8-bit ST. */
+static int string_is_st(Term *state, uint8_t b) {
+    if (state->utf8_mode && state->string_utf8_remaining > 0 &&
+        b >= 0x80 && b <= 0xbf) {
+        state->string_utf8_remaining--;
+        return 0;
+    }
+    int length = state->utf8_mode ? utf8_expected_len(b) : 1;
+    state->string_utf8_remaining = length > 1 ? length - 1 : 0;
+    return b == 0x9c;
+}
+
 static void osc_reset(Term *state) {
     state->osc_active = 0;
     state->osc_type = '\0';
     state->osc_esc_pending = 0;
     state->osc_overflow = 0;
     state->osc_len = 0;
+    state->string_utf8_remaining = 0;
 }
 
 static void osc_append_byte(Term *state, uint8_t b) {
@@ -2031,7 +2044,6 @@ static void csihandle(const char *seq, int len, Term *state,
     if ((cmd == 'h' || cmd == 'l') &&
         csi_has_param(param_values, param_count, 2)) {
         state->keyboard_lock = (cmd == 'h');
-        return;
     }
 
     if (cmd == 'n' && response_fn && param_count == 1) {
@@ -2103,7 +2115,7 @@ static void csihandle(const char *seq, int len, Term *state,
             int c = csi_param_default(param_values, param_count, 1, 1);
 
             if (state->origin_mode) {
-                r = min_row + r - 1;
+                r = r - 1 > max_row - min_row ? max_row : min_row + (r - 1);
             } else {
                 r--;
             }
@@ -2122,7 +2134,7 @@ static void csihandle(const char *seq, int len, Term *state,
             int max_row = cursor_max_row(state);
             int n = csi_param_default(param_values, param_count, 0, 1);
             cancel_pending_wrap(state);
-            state->row += n;
+            state->row += n > max_row - state->row ? max_row - state->row : n;
             if (state->row < min_row) state->row = min_row;
             if (state->row > max_row) state->row = max_row;
             state->col = 0;
@@ -2152,7 +2164,20 @@ static void csihandle(const char *seq, int len, Term *state,
             int n = (param_count ? param_values[0] : 0);
 
             cancel_pending_wrap(state);
-            if (n == 2 || n == 3) {
+            if (n == 3) {
+                if (history_lines) {
+                    for (int r = 0; r < HISTORY_SIZE; r++) {
+                        free_line_combs(&history_lines[r]);
+                        for (int c = 0; c < term_cols; c++)
+                            init_default_cell(&history_lines[r].line[c]);
+                    }
+                }
+                history_count = 0;
+                history_head = 0;
+                state->scrollback_offset = 0;
+                selclear();
+                mark_all_rows_dirty();
+            } else if (n == 2) {
                 clear_screen_range(0, 0, term_rows - 1, term_cols - 1, state);
             } else if (n == 0) {
                 clear_screen_range(state->row, state->col, term_rows - 1, term_cols - 1, state);
@@ -2186,14 +2211,17 @@ static void csihandle(const char *seq, int len, Term *state,
             int max_row = cursor_max_row(state);
             int n = csi_param_default(param_values, param_count, 0, 1);
             cancel_pending_wrap(state);
-            state->row += n;
+            state->row += n > max_row - state->row ? max_row - state->row : n;
             if (state->row > max_row) state->row = max_row;
         } break;
 
         case 'C': {
             int n = csi_param_default(param_values, param_count, 0, 1);
             cancel_pending_wrap(state);
-            state->col += n;
+            if (n > term_cols - state->col)
+                state->col = term_cols - 1;
+            else
+                state->col += n;
             if (state->col >= term_cols) {
                 if (state->autowrap_mode && state->col == term_cols) {
                     state->wrap_next = 1;
@@ -2217,7 +2245,7 @@ static void csihandle(const char *seq, int len, Term *state,
         case 'I': {
             int n = csi_param_default(param_values, param_count, 0, 1);
             cancel_pending_wrap(state);
-            while (n-- > 0) {
+            while (n-- > 0 && state->col < term_cols - 1) {
                 state->col = next_tab_stop_col(state->col);
             }
         } break;
@@ -2225,7 +2253,7 @@ static void csihandle(const char *seq, int len, Term *state,
         case 'Z': {
             int n = csi_param_default(param_values, param_count, 0, 1);
             cancel_pending_wrap(state);
-            while (n-- > 0) {
+            while (n-- > 0 && state->col > 0) {
                 state->col = prev_tab_stop_col(state->col);
             }
         } break;
@@ -2249,7 +2277,7 @@ static void csihandle(const char *seq, int len, Term *state,
             int r = csi_param_default(param_values, param_count, 0, 1);
             cancel_pending_wrap(state);
             if (state->origin_mode) {
-                r = min_row + r - 1;
+                r = r - 1 > max_row - min_row ? max_row : min_row + (r - 1);
             } else {
                 r--;
             }
@@ -2261,8 +2289,8 @@ static void csihandle(const char *seq, int len, Term *state,
         case 'a': {
             int n = csi_param_default(param_values, param_count, 0, 1);
             cancel_pending_wrap(state);
-            state->col += n;
-            if (state->col >= term_cols) state->col = term_cols - 1;
+            state->col += n > term_cols - 1 - state->col ?
+                term_cols - 1 - state->col : n;
         } break;
 
         case 'h': {
@@ -2412,7 +2440,7 @@ static void csihandle(const char *seq, int len, Term *state,
             if (n <= 0 || state->row < 0 || state->row >= term_rows) break;
             from = state->col;
             if (from < 0) from = 0;
-            shift = (from + n < term_cols) ? n : (term_cols - from);
+            shift = (n < term_cols - from) ? n : (term_cols - from);
             if (shift <= 0) break;
             shift_line_right(&term_lines[state->row], from, shift, state);
             mark_row_dirty(state->row);
@@ -2427,7 +2455,7 @@ static void csihandle(const char *seq, int len, Term *state,
             if (n <= 0 || state->row < 0 || state->row >= term_rows) break;
             from = state->col;
             if (from < 0) from = 0;
-            shift = (from + n < term_cols) ? n : (term_cols - from);
+            shift = (n < term_cols - from) ? n : (term_cols - from);
             if (shift <= 0) break;
             shift_line_left(&term_lines[state->row], from, shift, state);
             mark_row_dirty(state->row);
@@ -2496,8 +2524,7 @@ static void csihandle(const char *seq, int len, Term *state,
             if (n <= 0 || state->row < 0 || state->row >= term_rows) break;
             from = state->col;
             if (from < 0) from = 0;
-            to = from + n;
-            if (to > term_cols) to = term_cols;
+            to = from + (n < term_cols - from ? n : term_cols - from);
             clear_row_range(state->row, from, to - 1, state);
         } break;
 
@@ -2804,6 +2831,7 @@ void twrite(const uint8_t *bytes, size_t len, Term *state,
     while (i < buflen) {
         if (state->str_ignore_active) {
             uint8_t b = buf[i++];
+            int is_st = string_is_st(state, b);
 
             if (state->str_ignore_esc_pending) {
                 if (b == '\\') {
@@ -2814,7 +2842,7 @@ void twrite(const uint8_t *bytes, size_t len, Term *state,
                 state->str_ignore_esc_pending = 0;
             }
 
-            if (b == 0x9C || b == 0x18 || b == 0x1A) {
+            if (is_st || b == 0x18 || b == 0x1A) {
                 state->str_ignore_active = 0;
                 state->str_ignore_esc_pending = 0;
                 continue;
@@ -2827,6 +2855,7 @@ void twrite(const uint8_t *bytes, size_t len, Term *state,
 
         if (state->osc_active) {
             uint8_t b = buf[i++];
+            int is_st = string_is_st(state, b);
 
             if (state->osc_esc_pending) {
                 if (b == '\\') {
@@ -2837,7 +2866,11 @@ void twrite(const uint8_t *bytes, size_t len, Term *state,
                 state->osc_esc_pending = 0;
             }
 
-            if (b == 0x07 || b == 0x9C || b == 0x18 || b == 0x1A) {
+            if (b == 0x18 || b == 0x1A) {
+                osc_reset(state);
+                continue;
+            }
+            if (b == 0x07 || is_st) {
                 osc_finalize(state, response_fn, response_ctx);
                 continue;
             }
@@ -2990,6 +3023,7 @@ void twrite(const uint8_t *bytes, size_t len, Term *state,
                 state->osc_esc_pending = 0;
                 state->osc_overflow = 0;
                 state->osc_len = 0;
+                state->string_utf8_remaining = 0;
                 continue;
             }
 
@@ -3000,12 +3034,14 @@ void twrite(const uint8_t *bytes, size_t len, Term *state,
                 state->osc_esc_pending = 0;
                 state->osc_overflow = 0;
                 state->osc_len = 0;
+                state->string_utf8_remaining = 0;
                 continue;
             }
 
             if (buf[i] == 'P' || buf[i] == '_' || buf[i] == '^') {
                 i++;
                 state->str_ignore_active = 1;
+                state->string_utf8_remaining = 0;
                 state->str_ignore_esc_pending = 0;
                 continue;
             }
@@ -3099,6 +3135,7 @@ void twrite(const uint8_t *bytes, size_t len, Term *state,
             if (state->utf8_len == 0 && b == 0x90) {
                 state->utf8_len = 0;
                 state->str_ignore_active = 1;
+                state->string_utf8_remaining = 0;
                 state->str_ignore_esc_pending = 0;
                 continue;
             }
@@ -3150,11 +3187,13 @@ void twrite(const uint8_t *bytes, size_t len, Term *state,
                 state->osc_type = ']';
                 state->osc_esc_pending = 0;
                 state->osc_len = 0;
+                state->string_utf8_remaining = 0;
                 continue;
             }
             if (state->utf8_len == 0 && (b == 0x9E || b == 0x9F)) {
                 state->utf8_len = 0;
                 state->str_ignore_active = 1;
+                state->string_utf8_remaining = 0;
                 state->str_ignore_esc_pending = 0;
                 continue;
             }

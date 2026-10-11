@@ -132,6 +132,7 @@ typedef struct {
     uint8_t utf8_buf[4];
     int utf8_len;
 
+    int string_utf8_remaining; /* continuation bytes in OSC/DCS/APC/PM */
     int osc_active;
     char osc_type;
     int osc_esc_pending;
