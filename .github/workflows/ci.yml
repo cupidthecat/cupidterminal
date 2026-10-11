@@ -1,0 +1,32 @@
+name: ci
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    env:
+      CC: ${{ matrix.cc }}
+      LC_ALL: C.UTF-8
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang libx11-dev libxft-dev libfontconfig1-dev libfreetype6-dev libutf8proc-dev xvfb xdotool zenity x11-utils fonts-dejavu-core ncurses-term
+      - name: Build and test
+        run: make -j2 CC="$CC" test
+      - name: Sanitizer tests
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+          UBSAN_OPTIONS: halt_on_error=1
+        run: |
+          make clean
+          make -j2 CC="$CC" CFLAGS='-Wall -Wextra -Werror -std=c99 -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined' test-all
