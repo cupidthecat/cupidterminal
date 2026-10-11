@@ -1742,6 +1742,7 @@ static void terminal_hard_reset(Term *state) {
 
     state->utf8_len = 0;
     state->csi_pending_len = 0;
+    state->csi_discard = 0;
     state->str_ignore_active = 0;
     state->str_ignore_esc_pending = 0;
     state->scrollback_offset = 0;
@@ -1933,6 +1934,23 @@ void treset(Term *s) {
     s->current_mode = 0;
 }
 
+/* Prefixes and intermediate bytes are part of a CSI command's identity.
+ * Unsupported variants must not fall through to the ordinary final-byte handler. */
+static int csi_supported_form(const char *body, int len, char final) {
+    int i = 0;
+    int private = len > 0 && body[0] == '?';
+    if (private) i++;
+    for (; i < len; i++) {
+        unsigned char b = (unsigned char)body[i];
+        if ((b >= '0' && b <= '9') || b == ';') continue;
+        if (b == ':' && final == 'm' && !private) continue;
+        if (b == ' ' && i == len - 1 && final == 'q' && !private)
+            return 1;
+        return 0;
+    }
+    return 1;
+}
+
 static void csihandle(const char *seq, int len, Term *state,
     terminal_response_fn response_fn, void *response_ctx) {
     int param_values[16] = {0};
@@ -1945,6 +1963,7 @@ static void csihandle(const char *seq, int len, Term *state,
     }
 
     cmd = seq[len - 1];
+    if (!csi_supported_form(&seq[2], len - 3, cmd)) return;
     param_count = parse_csi_params_dec(&seq[2], len - 3, param_values, 16, &is_private);
 
     {
@@ -2857,6 +2876,48 @@ void tputc(char c, Term *state) {
  * dropped when the two are merged before parsing. */
 #define COMBINED_MAX (CSI_PENDING_MAX + 65536 + 16)
 
+/* Consume CSI parameters once, even when input ends between controls and
+ * the final byte. Pending bytes are normalized to the 7-bit introducer. */
+static size_t consume_csi(const uint8_t *buf, size_t len, size_t i, Term *state,
+    terminal_response_fn response_fn, void *response_ctx) {
+    uint8_t seq[CSI_PENDING_MAX];
+    size_t used = 2;
+    int discard = state->csi_discard;
+    seq[0] = 0x1b;
+    seq[1] = '[';
+    state->csi_discard = 0;
+    while (i < len) {
+        uint8_t b = buf[i];
+        if (b == 0x1b) return i; /* The outer parser handles a fresh escape. */
+        i++;
+        if (b == 0x18 || b == 0x1a) return i;
+        if (b < 0x20) {
+            if (b == 0x0e || b == 0x0f) {
+                state->gl = b == 0x0e;
+                state->utf8_len = 0;
+            } else {
+                tputc((char)b, state);
+            }
+            continue;
+        }
+        if (b == 0x7f) continue;
+        if (used == sizeof seq) discard = 1;
+        if (!discard) seq[used++] = b;
+        if (b >= '@' && b <= '~') {
+            if (!discard)
+                csihandle((const char *)seq, (int)used, state, response_fn, response_ctx);
+            return i;
+        }
+    }
+    if (discard) {
+        state->csi_discard = 1;
+    } else {
+        memcpy(state->csi_pending, seq, used);
+        state->csi_pending_len = (int)used;
+    }
+    return i;
+}
+
 static void twrite_chunk(const uint8_t *bytes, size_t len, Term *state,
     terminal_response_fn response_fn, void *response_ctx) {
     size_t pending_before;
@@ -2885,6 +2946,10 @@ static void twrite_chunk(const uint8_t *bytes, size_t len, Term *state,
 
     size_t i = 0;
     while (i < buflen) {
+        if (state->csi_discard) {
+            i = consume_csi(buf, buflen, i, state, response_fn, response_ctx);
+            continue;
+        }
         if (state->str_ignore_active) {
             uint8_t b = buf[i++];
             int is_st = string_is_st(state, b);
@@ -3048,33 +3113,8 @@ static void twrite_chunk(const uint8_t *bytes, size_t len, Term *state,
             }
 
             if (buf[i] == '[') {
-                size_t q;
-
-                i++;
-                q = i;
-                while (q < buflen && !(buf[q] >= '@' && buf[q] <= '~') &&
-                       buf[q] != 0x18 && buf[q] != 0x1a && buf[q] != 0x1b) {
-                    q++;
-                }
-
-                if (q < buflen && (buf[q] == 0x18 || buf[q] == 0x1a || buf[q] == 0x1b)) {
-                    i = buf[q] == 0x1b ? q : q + 1;
-                    continue;
-                }
-                if (q < buflen) {
-                    int seq_len = (int)(q - start + 1);
-                    csihandle((const char *)&buf[start], seq_len, state, response_fn, response_ctx);
-                    i = q + 1;
-                    continue;
-                }
-
-                /* Partial CSI: save for next read */
-                size_t tail = buflen - start;
-                if (tail > 0 && tail <= CSI_PENDING_MAX) {
-                    memcpy(state->csi_pending, buf + start, tail);
-                    state->csi_pending_len = (int)tail;
-                }
-                break;
+                i = consume_csi(buf, buflen, i + 1, state, response_fn, response_ctx);
+                continue;
             }
 
             if (buf[i] == ']') {
@@ -3201,42 +3241,8 @@ static void twrite_chunk(const uint8_t *bytes, size_t len, Term *state,
                 continue;
             }
             if (state->utf8_len == 0 && b == 0x9B) {
-                size_t start = i - 1;
-                size_t q = i;
-
-                while (q < buflen && !(buf[q] >= '@' && buf[q] <= '~') &&
-                       buf[q] != 0x18 && buf[q] != 0x1a && buf[q] != 0x1b) {
-                    q++;
-                }
-                if (q < buflen && (buf[q] == 0x18 || buf[q] == 0x1a || buf[q] == 0x1b)) {
-                    i = buf[q] == 0x1b ? q : q + 1;
-                    continue;
-                }
-                if (q < buflen) {
-                    size_t seq_len = q - start + 1;
-                    char seq_buf[CSI_PENDING_MAX + 4];
-
-                    if (seq_len > CSI_PENDING_MAX) {
-                        seq_len = CSI_PENDING_MAX;
-                    }
-                    seq_buf[0] = '\033';
-                    seq_buf[1] = '[';
-                    if (seq_len > 1) {
-                        memcpy(seq_buf + 2, buf + start + 1, seq_len - 1);
-                    }
-                    csihandle(seq_buf, (int)(seq_len + 1), state, response_fn, response_ctx);
-                    i = q + 1;
-                    continue;
-                }
-
-                {
-                    size_t tail = buflen - start;
-                    if (tail > 0 && tail <= CSI_PENDING_MAX) {
-                        memcpy(state->csi_pending, buf + start, tail);
-                        state->csi_pending_len = (int)tail;
-                    }
-                }
-                break;
+                i = consume_csi(buf, buflen, i, state, response_fn, response_ctx);
+                continue;
             }
             if (state->utf8_len == 0 && b == 0x9C) {
                 state->utf8_len = 0;
