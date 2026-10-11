@@ -44,8 +44,13 @@ static void handle_sigchld(int sig) {
     unsigned char byte = 1;
     (void)sig;
     g_sigchld_pending = 1;
-    if (sigchld_pipe[1] >= 0)
-        (void)write(sigchld_pipe[1], &byte, sizeof byte);
+    if (sigchld_pipe[1] >= 0) {
+        ssize_t written;
+        do {
+            written = write(sigchld_pipe[1], &byte, sizeof byte);
+        } while (written < 0 && errno == EINTR);
+        /* EAGAIN means an earlier notification is already pending. */
+    }
     errno = saved_errno;
 }
 
