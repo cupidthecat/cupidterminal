@@ -1667,7 +1667,7 @@ static void osc_finalize(Term *state, terminal_response_fn response_fn,
     osc_reset(state);
 }
 
-static void terminal_soft_reset(Term *state) {
+static void terminal_hard_reset(Term *state) {
     if (!state) {
         return;
     }
@@ -1697,7 +1697,15 @@ static void terminal_soft_reset(Term *state) {
     state->origin_mode = 0;
     state->insert_mode = 0;
     state->print_mode = 0;
+    state->echo_mode = 0;
+    state->lnm_mode = 0;
+    state->utf8_mode = 1;
+    state->focus_mode = 0;
+    state->screen_reverse = 0;
+    state->cursorshape = 0;
+    state->sel_active = 0;
     state->wrap_next = 0;
+    state->wrap_overwrite_next = 0;
 
     state->mouse_reporting_basic = 0;
     state->mouse_reporting_button = 0;
@@ -2964,7 +2972,7 @@ static void twrite_chunk(const uint8_t *bytes, size_t len, Term *state,
                 continue;
             }
             if (buf[i] == 'c') {
-                terminal_soft_reset(state);
+                terminal_hard_reset(state);
                 i++;
                 continue;
             }
