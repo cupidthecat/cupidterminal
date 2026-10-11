@@ -1758,6 +1758,9 @@ void tresize(int new_rows, int new_cols) {
         return;
     }
 
+    /* Resizing can discard or move either endpoint of a selection. */
+    selclear();
+
     new_primary_tl = resize_term_lines(primary_term_lines, old_rows, old_cols,
                                        new_rows, new_cols, row_shift);
     if (!new_primary_tl) {
@@ -2829,7 +2832,7 @@ void tputc(char c, Term *state) {
  * dropped when the two are merged before parsing. */
 #define COMBINED_MAX (CSI_PENDING_MAX + 65536 + 16)
 
-void twrite(const uint8_t *bytes, size_t len, Term *state,
+static void twrite_chunk(const uint8_t *bytes, size_t len, Term *state,
     terminal_response_fn response_fn, void *response_ctx) {
     size_t pending_before;
 
@@ -3245,6 +3248,18 @@ void twrite(const uint8_t *bytes, size_t len, Term *state,
             else
                 tputc((char)b, state);
         }
+    }
+}
+
+/* Keep each parser call within the pending-sequence merge buffer. */
+void twrite(const uint8_t *bytes, size_t len, Term *state,
+    terminal_response_fn response_fn, void *response_ctx) {
+    if (!bytes || !state) return;
+    while (len > 0) {
+        size_t chunk = len > 65536 ? 65536 : len;
+        twrite_chunk(bytes, chunk, state, response_fn, response_ctx);
+        bytes += chunk;
+        len -= chunk;
     }
 }
 
