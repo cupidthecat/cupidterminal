@@ -858,7 +858,7 @@ static void scroll_up_one_line(Term *state) {
         term_lines[bottom] = saved;
         free_row_combs(bottom);
         for (int c = 0; c < term_cols; c++) {
-            init_default_cell(&term_lines[bottom].line[c]);
+            clear_cell(&term_lines[bottom].line[c], state);
         }
         term_lines[bottom].dirty = 1;
     }
@@ -896,7 +896,7 @@ static void scroll_down_one_line(Term *state) {
         term_lines[top] = saved;
         free_row_combs(top);
         for (int c = 0; c < term_cols; c++) {
-            init_default_cell(&term_lines[top].line[c]);
+            clear_cell(&term_lines[top].line[c], state);
         }
         term_lines[top].dirty = 1;
     }
@@ -2516,7 +2516,7 @@ static void csihandle(const char *seq, int len, Term *state,
                 term_lines[r] = displaced;
                 free_row_combs(r);
                 for (int c = 0; c < term_cols; c++)
-                    init_default_cell(&term_lines[r].line[c]);
+                    clear_cell(&term_lines[r].line[c], state);
                 term_lines[r].dirty = 1;
             }
             mark_rows_dirty(r, bottom);
@@ -2543,7 +2543,7 @@ static void csihandle(const char *seq, int len, Term *state,
                 term_lines[bottom] = displaced;
                 free_row_combs(bottom);
                 for (int c = 0; c < term_cols; c++)
-                    init_default_cell(&term_lines[bottom].line[c]);
+                    clear_cell(&term_lines[bottom].line[c], state);
                 term_lines[bottom].dirty = 1;
             }
             mark_rows_dirty(r, bottom);
