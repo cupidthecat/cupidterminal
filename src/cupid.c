@@ -3526,22 +3526,26 @@ void ttywrite(const char *s, size_t n, int may_echo) {
     if (may_echo && term.echo_mode)
         twrite((const uint8_t *)s, n, &term, NULL, NULL);
 
-    to_write = (const uint8_t *)s;
-    to_len   = n;
-
-    if (term.lnm_mode && n <= sizeof(expanded) / 2) {
-        size_t out = 0;
-        for (size_t i = 0; i < n && out + 2 <= sizeof(expanded); i++) {
-            if (((const uint8_t *)s)[i] == '\r') {
-                expanded[out++] = '\r';
-                expanded[out++] = '\n';
-            } else {
-                expanded[out++] = ((const uint8_t *)s)[i];
+    if (term.lnm_mode) {
+        size_t in = 0;
+        while (in < n) {
+            size_t out = 0;
+            while (in < n && out + 2 <= sizeof expanded) {
+                unsigned char ch = (unsigned char)s[in++];
+                expanded[out++] = ch;
+                if (ch == '\r') expanded[out++] = '\n';
+            }
+            if (g_pty_session.master_fd >= 0 &&
+                pty_session_write(&g_pty_session, expanded, out) < 0) {
+                perror("write error on tty");
+                return;
             }
         }
-        to_write = expanded;
-        to_len   = out;
+        return;
     }
+
+    to_write = (const uint8_t *)s;
+    to_len = n;
 
     if (g_pty_session.master_fd >= 0) {
         if (pty_session_write(&g_pty_session, to_write, to_len) < 0)

@@ -74,6 +74,10 @@ $(TEST_BIN_DIR)/screen_%: test/screen/%.c $(TEST_COMMON_OBJ) build/cupid_test.o 
 $(TEST_BIN_DIR)/utf8_%: test/utf8/%.c $(TEST_COMMON_OBJ) build/cupid_test.o build/pty.o src/config.h | $(TEST_BIN_DIR)
 	$(CC) $(TEST_CFLAGS) $< $(TEST_COMMON_OBJ) build/cupid_test.o build/pty.o -o $@ -lutf8proc
 
+# Include the terminal writer directly so its PTY transport can be captured.
+$(TEST_BIN_DIR)/pty_test_ttywrite_lnm: test/pty/test_ttywrite_lnm.c src/cupid.c $(TEST_COMMON_OBJ) build/pty.o src/config.h | $(TEST_BIN_DIR)
+	$(CC) $(TEST_CFLAGS) $< $(TEST_COMMON_OBJ) build/pty.o -o $@ -lutf8proc
+
 $(TEST_BIN_DIR)/pty_%: test/pty/%.c build/pty.o src/config.h | $(TEST_BIN_DIR)
 	$(CC) $(TEST_CFLAGS) $< build/pty.o -o $@
 
