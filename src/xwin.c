@@ -17,7 +17,8 @@
 #include <unistd.h>
 #include <termios.h>
 #include <wchar.h>
-#include <sys/select.h>
+#include <poll.h>
+#include <limits.h>
 #include "xconfig.h"
 #include "cupid.h"
 #include "xwin.h"
@@ -1908,6 +1909,8 @@ void xinit(int cols, int rows, PtySession *session) {
         StructureNotifyMask | FocusChangeMask |
         ButtonPressMask | ButtonReleaseMask | PointerMotionMask);
     x_gc = XCreateGC(x_display, x_window, 0, NULL);
+    /* Back-buffer copies must not feed NoExpose events back into redraws. */
+    XSetGraphicsExposures(x_display, x_gc, False);
 
     initialize_xft(x_display, x_window);
     xsettitle((char *)title);
@@ -1987,7 +1990,7 @@ void xinit(int cols, int rows, PtySession *session) {
 
 void run(void) {
     XEvent event;
-    fd_set fds, wfds;
+    struct pollfd fds[2];
     Atom XA_UTF8    = XInternAtom(x_display, "UTF8_STRING", False);
     Atom XA_TEXT    = XInternAtom(x_display, "TEXT", False);
     Atom XA_TARGETS = XInternAtom(x_display, "TARGETS", False);
@@ -1998,25 +2001,16 @@ void run(void) {
     struct timespec now;
 
     while (1) {
-        int x11_fd, nfds, ready;
-        struct timeval *tv_ptr = NULL, tv;
+        int ready, wait_ms = -1;
         double timeout_ms = -1, elapsed;
 
         pty_reap(g_x_session);
         if (!pty_session_child_alive(g_x_session)) break;
 
-        FD_ZERO(&fds);
-        FD_ZERO(&wfds);
-        x11_fd = ConnectionNumber(x_display);
-        FD_SET(x11_fd, &fds);
-        nfds = x11_fd + 1;
-
-        if (g_x_session->master_fd >= 0) {
-            FD_SET(g_x_session->master_fd, &fds);
-            if (pty_session_wants_write(g_x_session))
-                FD_SET(g_x_session->master_fd, &wfds);
-            if (g_x_session->master_fd >= nfds) nfds = g_x_session->master_fd + 1;
-        }
+        fds[0] = (struct pollfd){ConnectionNumber(x_display), POLLIN, 0};
+        fds[1] = (struct pollfd){g_x_session->master_fd, POLLIN, 0};
+        if (pty_session_wants_write(g_x_session))
+            fds[1].events |= POLLOUT;
 
         if (XPending(x_display)) {
             timeout_ms = 0;
@@ -2027,33 +2021,56 @@ void run(void) {
             if (timeout_ms <= 0) timeout_ms = 0;
         }
 
-        if (timeout_ms >= 0) {
-            tv.tv_sec  = (long)(timeout_ms / 1000);
-            tv.tv_usec = (long)((timeout_ms - tv.tv_sec*1000.0) * 1000);
-            if (tv.tv_sec < 0) tv.tv_sec = 0;
-            if (tv.tv_usec < 0) tv.tv_usec = 0;
-            tv_ptr = &tv;
+        /* Idle blinking needs a timer even when neither fd becomes readable. */
+        if (blinktimeout > 0) {
+            int blinking = 0;
+            for (int r = 0; r < term_rows && !blinking; r++) {
+                const Glyph *line = tgetline(r);
+                for (int c = 0; line && c < term_cols; c++)
+                    if (line[c].mode & ATTR_BLINK) { blinking = 1; break; }
+            }
+            if (blinking) {
+                double blink_wait = 0;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                if (blink_initialized) {
+                    double since = (now.tv_sec - blink_last_toggle.tv_sec) * 1000.0 +
+                        (now.tv_nsec - blink_last_toggle.tv_nsec) / 1e6;
+                    blink_wait = blinktimeout - since;
+                    if (blink_wait < 0) blink_wait = 0;
+                }
+                if (timeout_ms < 0 || blink_wait < timeout_ms)
+                    timeout_ms = blink_wait;
+            }
         }
-
-        ready = select(nfds, &fds, &wfds, NULL, tv_ptr);
+        if (timeout_ms >= 0) {
+            if (timeout_ms >= INT_MAX) wait_ms = INT_MAX;
+            else {
+                wait_ms = (int)timeout_ms;
+                if (wait_ms < timeout_ms) wait_ms++;
+            }
+        }
+        ready = poll(fds, 2, wait_ms);
         if (ready < 0) {
             if (errno == EINTR) continue;
-            perror("select failed");
+            perror("poll failed");
             break;
         }
+        if ((fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) ||
+            (fds[1].revents & POLLNVAL))
+            break;
 
         clock_gettime(CLOCK_MONOTONIC, &now);
         int had_input = 0;
 
         if (ready > 0 && g_x_session->master_fd >= 0 &&
-            FD_ISSET(g_x_session->master_fd, &wfds)) {
+            (fds[1].revents & POLLOUT)) {
             if (pty_session_flush(g_x_session) < 0) {
                 perror("write error on tty");
                 break;
             }
         }
 
-        if (ready > 0 && g_x_session->master_fd >= 0 && FD_ISSET(g_x_session->master_fd, &fds)) {
+        if (ready > 0 && g_x_session->master_fd >= 0 && (fds[1].revents & (POLLIN | POLLHUP | POLLERR))) {
             had_input = 1;
             if (!handle_pty_output(x_display, x_window, x_gc, g_x_session, &term)) {
                 pty_reap(g_x_session);
