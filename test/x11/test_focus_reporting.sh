@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-for command in Xvfb xdpyinfo xdotool zenity od; do
+for command in Xvfb xdpyinfo xdotool od "${CC:-cc}"; do
     command -v "$command" >/dev/null || {
         echo "SKIP: x11/focus_reporting ($command unavailable)"
         exit 0
@@ -31,8 +31,8 @@ for _ in $(seq 1 50); do
 done
 xdpyinfo >/dev/null 2>&1 || { echo "TEST FAILURE: Xvfb did not start" >&2; exit 1; }
 
-zenity --info --title=cupid-focus-peer --text=waiting \
-    >"$test_dir/peer.log" 2>&1 &
+"${CC:-cc}" -Wall -Wextra -Werror -std=c99 test/x11/focus_peer.c -o "$test_dir/focus_peer" -lX11
+"$test_dir/focus_peer" >"$test_dir/peer.log" 2>&1 &
 peer_pid=$!
 
 CUPID_FOCUS_OUT="$test_dir/focus.bin" ./cupidterminal \
@@ -50,6 +50,7 @@ for _ in $(seq 1 50); do
     sleep 0.1
 done
 [[ -n "$cupid_window" && -n "$peer_window" ]] || {
+    cat "$test_dir/xvfb.log" "$test_dir/peer.log" "$test_dir/terminal.log" >&2
     echo "TEST FAILURE: X11 focus fixtures did not map" >&2
     exit 1
 }
