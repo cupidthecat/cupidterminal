@@ -187,6 +187,7 @@ static int faint_color_allocated[COLOR_CACHE_SIZE] = {0};
 typedef struct { uint32_t key; XftColor color; } TcEntry;
 static TcEntry tc_hash[TC_HASH_SIZE];
 static TcEntry tc_faint_hash[TC_HASH_SIZE];
+static unsigned tc_last_slot[2] = {TC_HASH_SIZE, TC_HASH_SIZE};
 
 static int blink_hidden = 0;
 static int blink_initialized = 0;
@@ -396,17 +397,21 @@ static int parse_config_color(uint32_t idx, XRenderColor *out) {
     return 1;
 }
 
+static uint32_t resolve_color_override(uint32_t c) {
+    if (c == COLOR_DEFAULT_FG && term.osc_fg_color)
+        return term.osc_fg_color;
+    if (c == COLOR_DEFAULT_BG && term.osc_bg_color)
+        return term.osc_bg_color;
+    if (c == 256 && term.osc_cs_color)
+        return term.osc_cs_color;
+    if (c < 256 && term.palette_overridden[c])
+        return term.palette_override[c];
+    return c;
+}
+
 static XRenderColor get_xrender_color(uint32_t c, int is_bg, int is_faint) {
     XRenderColor xc;
-
-    if (c == COLOR_DEFAULT_FG && term.osc_fg_color)
-        c = term.osc_fg_color;
-    else if (c == COLOR_DEFAULT_BG && term.osc_bg_color)
-        c = term.osc_bg_color;
-    else if (c == 256 && term.osc_cs_color)
-        c = term.osc_cs_color;
-    else if (c < 256 && term.palette_overridden[c])
-        c = term.palette_override[c];
+    c = resolve_color_override(c);
 
     if (IS_TRUECOL(c)) {
         unsigned int r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
@@ -460,25 +465,48 @@ static XRenderColor get_xrender_color(uint32_t c, int is_bg, int is_faint) {
 static XftColor *get_xft_color(Display *d, Window w, uint32_t logical_color, int is_bg, int is_faint) {
     size_t idx;
     (void)w;
+    logical_color = resolve_color_override(logical_color);
 
     if (logical_color > COLOR_DEFAULT_BG && !IS_TRUECOL(logical_color))
         return is_bg ? &xft_color_bg : &xft_color_fg;
 
     if (IS_TRUECOL(logical_color)) {
-        TcEntry *table = (is_faint && !is_bg) ? tc_faint_hash : tc_hash;
+        unsigned variant = (is_faint && !is_bg) ? 1u : 0u;
+        TcEntry *table = variant ? tc_faint_hash : tc_hash;
         unsigned slot = ((logical_color & 0xFFFFFFu) * 2654435769u) >> 22;
         unsigned probe;
         for (probe = 0; probe < TC_HASH_SIZE; probe++) {
             unsigned s = (slot + probe) & TC_HASH_MASK;
-            if (table[s].key == logical_color) return &table[s].color;
+            if (table[s].key == logical_color) {
+                tc_last_slot[variant] = s;
+                return &table[s].color;
+            }
             if (table[s].key == 0) {
                 XRenderColor rc = get_xrender_color(logical_color, is_bg, is_faint);
                 if (XftColorAllocValue(d, DefaultVisual(d, DefaultScreen(d)),
                         DefaultColormap(d, DefaultScreen(d)), &rc, &table[s].color)) {
                     table[s].key = logical_color;
+                    tc_last_slot[variant] = s;
                     return &table[s].color;
                 }
                 break;
+            }
+        }
+        if (probe == TC_HASH_SIZE) {
+            XftColor replacement;
+            XRenderColor rc = get_xrender_color(logical_color, is_bg, is_faint);
+            /* Drawing can retain the previous lookup while requesting the
+             * next background run or the other cursor color. Keep it alive. */
+            if (slot == tc_last_slot[variant])
+                slot = (slot + 1) & TC_HASH_MASK;
+            if (XftColorAllocValue(d, DefaultVisual(d, DefaultScreen(d)),
+                    DefaultColormap(d, DefaultScreen(d)), &rc, &replacement)) {
+                XftColorFree(d, DefaultVisual(d, DefaultScreen(d)),
+                    DefaultColormap(d, DefaultScreen(d)), &table[slot].color);
+                table[slot].color = replacement;
+                table[slot].key = logical_color;
+                tc_last_slot[variant] = slot;
+                return &table[slot].color;
             }
         }
         return is_bg ? &xft_color_bg : &xft_color_fg;
@@ -934,7 +962,8 @@ void draw_text(Display *display, Window window, GC gc) {
 
     int full = draw_full_refresh;
     draw_full_refresh = 0;
-    if (full) XftDrawRect(draw, &xft_color_bg, 0, 0, buf_w, buf_h);
+    if (full) XftDrawRect(draw, get_xft_color(display, window, COLOR_DEFAULT_BG, 1, 0),
+                          0, 0, buf_w, buf_h);
 
     for (int r = 0; r < term_rows; r++) {
         const Glyph *row_cells = tgetline(r);
@@ -945,7 +974,8 @@ void draw_text(Display *display, Window window, GC gc) {
         int y = baseline0 + r * (g_cell_h + line_gap);
         int row_top = y - xft_font->ascent;
 
-        if (!full) XftDrawRect(draw, &xft_color_bg, 0, row_top, buf_w, g_cell_h);
+        if (!full) XftDrawRect(draw, get_xft_color(display, window, COLOR_DEFAULT_BG, 1, 0),
+                               0, row_top, buf_w, g_cell_h);
 
         /* Pass 1: background run batching */
         {

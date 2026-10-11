@@ -24,7 +24,7 @@ SCREEN_TEST_BINS := $(patsubst test/screen/%.c,$(TEST_BIN_DIR)/screen_%,$(SCREEN
 UTF8_TEST_BINS := $(patsubst test/utf8/%.c,$(TEST_BIN_DIR)/utf8_%,$(UTF8_TEST_SRCS))
 PTY_TEST_BINS := $(patsubst test/pty/%.c,$(TEST_BIN_DIR)/pty_%,$(PTY_TEST_SRCS))
 
-.PHONY: all clean test test-all test-parser test-screen test-utf8 test-pty test-x11 test-manual install install-terminfo check-no-x11
+.PHONY: all clean test test-all test-parser test-screen test-utf8 test-pty test-render test-x11 test-manual install install-terminfo check-no-x11
 
 PREFIX ?= /usr/local
 BINDIR = $(PREFIX)/bin
@@ -92,7 +92,7 @@ check-no-x11:
 
 test: check-no-x11 test-all test-x11
 
-test-all: test-parser test-screen test-utf8 test-pty
+test-all: test-parser test-screen test-utf8 test-pty test-render
 	@echo "All automated test suites PASSED."
 
 test-parser: $(PARSER_TEST_BINS)
@@ -106,6 +106,17 @@ test-utf8: $(UTF8_TEST_BINS)
 
 test-pty: $(PTY_TEST_BINS)
 	@set -e; for t in $(PTY_TEST_BINS); do echo "Running $$t"; "$$t"; done
+
+# Keep the normal configuration globals while renaming the program entry point.
+build/cupid_render_test.o: src/cupid.c src/cupid.h src/config.h src/pty.h src/xentry.h src/xwin.h src/arg.h
+	mkdir -p build
+	$(CC) $(TEST_CFLAGS) -Dmain=cupid_program_main -c $< -o $@
+
+$(TEST_BIN_DIR)/render_test_color_cache: test/render/test_color_cache.c src/xwin.c src/xconfig.h src/cupid.h src/xwin.h src/xentry.h src/pty.h build/cupid_render_test.o build/pty.o | $(TEST_BIN_DIR)
+	$(CC) $(TEST_CFLAGS) -I/usr/include/freetype2 $< build/cupid_render_test.o build/pty.o -o $@ $(LDFLAGS)
+
+test-render: $(TEST_BIN_DIR)/render_test_color_cache
+	$(TEST_BIN_DIR)/render_test_color_cache
 
 test-x11: $(TARGET)
 	@bash test/x11/test_focus_reporting.sh
