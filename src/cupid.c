@@ -1444,6 +1444,8 @@ static size_t osc52_decode_base64(const char *encoded, uint8_t *out, size_t out_
         }
 
         if (*p == '=') {
+            if (vcount < 2 || saw_pad >= 2)
+                return 0;
             saw_pad++;
             if (vcount >= 4) {
                 return 0;
@@ -1491,6 +1493,9 @@ static size_t osc52_decode_base64(const char *encoded, uint8_t *out, size_t out_
         }
     }
 
+    /* Once padding starts, a complete four-character group is required. */
+    if (saw_pad)
+        return 0;
     if (vcount == 2) {
         if (out_len + 1 > out_cap) {
             return 0;
@@ -1540,6 +1545,18 @@ static void osc_color_response(int command, int index, int is_palette,
         response_fn((const uint8_t *)response, (size_t)len, response_ctx);
 }
 
+/* Parse an OSC number without accepting signs, junk, or narrowing overflow. */
+static int osc_number(const char *first, const char *last, int *value) {
+    int n = 0;
+    for (const char *p = first; p < last; p++) {
+        if (*p < '0' || *p > '9' || n > (INT_MAX - (*p - '0')) / 10)
+            return 0;
+        n = n * 10 + (*p - '0');
+    }
+    *value = n;
+    return 1;
+}
+
 static void osc_finalize(Term *state, terminal_response_fn response_fn,
     void *response_ctx) {
     const char *payload;
@@ -1565,13 +1582,11 @@ static void osc_finalize(Term *state, terminal_response_fn response_fn,
         return;
     }
     semi = strchr(payload, ';');
-    if (!semi) {
-        cmd = (int)strtol(payload, NULL, 10);
-        arg1 = "";
-    } else {
-        cmd = (int)strtol(payload, NULL, 10);
-        arg1 = semi + 1;
+    if (!osc_number(payload, semi ? semi : payload + strlen(payload), &cmd)) {
+        osc_reset(state);
+        return;
     }
+    arg1 = semi ? semi + 1 : "";
 
     if (cmd == 0 || cmd == 1 || cmd == 2) {
         const char *title = arg1;
@@ -1591,8 +1606,8 @@ static void osc_finalize(Term *state, terminal_response_fn response_fn,
         const char *idx_end;
         int idx;
         uint32_t col;
-        idx = (int)strtol(arg1, (char **)&idx_end, 10);
-        if (idx_end > arg1 && *idx_end == ';' && idx >= 0 && idx < 256) {
+        idx_end = strchr(arg1, ';');
+        if (idx_end && idx_end > arg1 && osc_number(arg1, idx_end, &idx) && idx < 256) {
             const char *colstr = idx_end + 1;
             if (strcmp(colstr, "?") == 0) {
                 osc_color_response(idx, idx, 1, response_fn, response_ctx);
