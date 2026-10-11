@@ -394,6 +394,14 @@ int pty_session_spawn(PtySession *session, const char *line,
             _exit(EXIT_FAILURE);
         }
 
+        /* dup2(fd, fd) does not clear CLOEXEC when the slave is already 0-2. */
+        for (int fd = STDIN_FILENO; fd <= STDERR_FILENO; fd++) {
+            if (fcntl(fd, F_SETFD, 0) < 0) {
+                perror("fcntl standard descriptor");
+                _exit(EXIT_FAILURE);
+            }
+        }
+
         if (ioctl(slave_fd, TIOCSCTTY, NULL) < 0) {
             perror("TIOCSCTTY");
             _exit(EXIT_FAILURE);

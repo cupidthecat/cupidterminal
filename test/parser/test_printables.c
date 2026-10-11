@@ -37,13 +37,14 @@ int main(void) {
         test_assert_cell(0, 1, "b", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
     }
 
-    /* Invalid UTF-8 (0xC0 + 'b') is rejected; next valid char writes */
+    /* An invalid prefix must not consume either following ASCII character. */
     test_reset_terminal(2, 16);
     test_feed_string("a");
     test_feed_bytes((const uint8_t *)"\xC0\x62", 2);  /* invalid 2-byte sequence */
     test_feed_string("b");
     test_assert_cell(0, 0, "a", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
     test_assert_cell(0, 1, "b", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
+    test_assert_cell(0, 2, "b", COLOR_DEFAULT_FG, COLOR_DEFAULT_BG, 0);
 
     test_print_ok("parser/printables");
     return 0;

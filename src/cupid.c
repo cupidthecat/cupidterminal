@@ -2651,6 +2651,11 @@ void tputc(char c, Term *state) {
         return;
     }
 
+    if (state->utf8_len > 0 && ((uint8_t)c & 0xc0) != 0x80) {
+        /* Discard the incomplete prefix, not the valid byte that follows it. */
+        state->utf8_len = 0;
+    }
+
     if (state->utf8_len >= (int)sizeof(state->utf8_buf)) {
         state->utf8_len = 0;
     }
@@ -3019,10 +3024,15 @@ void twrite(const uint8_t *bytes, size_t len, Term *state,
 
                 i++;
                 q = i;
-                while (q < buflen && !(buf[q] >= '@' && buf[q] <= '~')) {
+                while (q < buflen && !(buf[q] >= '@' && buf[q] <= '~') &&
+                       buf[q] != 0x18 && buf[q] != 0x1a && buf[q] != 0x1b) {
                     q++;
                 }
 
+                if (q < buflen && (buf[q] == 0x18 || buf[q] == 0x1a || buf[q] == 0x1b)) {
+                    i = buf[q] == 0x1b ? q : q + 1;
+                    continue;
+                }
                 if (q < buflen) {
                     int seq_len = (int)(q - start + 1);
                     csihandle((const char *)&buf[start], seq_len, state, response_fn, response_ctx);
@@ -3166,8 +3176,13 @@ void twrite(const uint8_t *bytes, size_t len, Term *state,
                 size_t start = i - 1;
                 size_t q = i;
 
-                while (q < buflen && !(buf[q] >= '@' && buf[q] <= '~')) {
+                while (q < buflen && !(buf[q] >= '@' && buf[q] <= '~') &&
+                       buf[q] != 0x18 && buf[q] != 0x1a && buf[q] != 0x1b) {
                     q++;
+                }
+                if (q < buflen && (buf[q] == 0x18 || buf[q] == 0x1a || buf[q] == 0x1b)) {
+                    i = buf[q] == 0x1b ? q : q + 1;
+                    continue;
                 }
                 if (q < buflen) {
                     size_t seq_len = q - start + 1;
@@ -3225,7 +3240,10 @@ void twrite(const uint8_t *bytes, size_t len, Term *state,
                 response_fn((const uint8_t *)vtiden, strlen(vtiden), response_ctx);
                 continue;
             }
-            tputc((char)b, state);
+            if (!state->utf8_mode && b >= 0xa0)
+                put_codepoint((utf8proc_int32_t)b, state);
+            else
+                tputc((char)b, state);
         }
     }
 }
