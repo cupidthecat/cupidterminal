@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-for command in Xvfb xdotool od; do
+for command in Xvfb xdpyinfo xdotool od; do
     command -v "$command" >/dev/null || {
         echo "SKIP: x11/keyboard_input ($command unavailable)"
         exit 0
@@ -23,7 +23,11 @@ trap cleanup EXIT
 Xvfb "$display_name" -screen 0 1024x768x24 >"$test_dir/xvfb.log" 2>&1 &
 xvfb_pid=$!
 export DISPLAY=$display_name
-sleep 0.2
+for _ in $(seq 1 50); do
+    if xdpyinfo >/dev/null 2>&1; then break; fi
+    sleep 0.1
+done
+xdpyinfo >/dev/null 2>&1 || { echo "TEST FAILURE: Xvfb did not start" >&2; exit 1; }
 
 CUPID_KEY_OUT="$test_dir/keys.bin" ./cupidterminal \
     -T cupid-key-test -e sh -c \
@@ -33,7 +37,7 @@ terminal_pid=$!
 
 cupid_window=
 for _ in $(seq 1 50); do
-    cupid_window=$(xdotool search --name cupid-key-ready 2>/dev/null | head -1 || true)
+    cupid_window=$(xdotool search --onlyvisible --name cupid-key-ready 2>/dev/null | head -1 || true)
     if [[ -n "$cupid_window" ]]; then break; fi
     sleep 0.1
 done

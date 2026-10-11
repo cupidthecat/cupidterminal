@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-for command in Xvfb xdotool zenity od; do
+for command in Xvfb xdpyinfo xdotool zenity od; do
     command -v "$command" >/dev/null || {
         echo "SKIP: x11/focus_reporting ($command unavailable)"
         exit 0
@@ -25,7 +25,11 @@ trap cleanup EXIT
 Xvfb "$display_name" -screen 0 1024x768x24 >"$test_dir/xvfb.log" 2>&1 &
 xvfb_pid=$!
 export DISPLAY=$display_name
-sleep 0.2
+for _ in $(seq 1 50); do
+    if xdpyinfo >/dev/null 2>&1; then break; fi
+    sleep 0.1
+done
+xdpyinfo >/dev/null 2>&1 || { echo "TEST FAILURE: Xvfb did not start" >&2; exit 1; }
 
 zenity --info --title=cupid-focus-peer --text=waiting \
     >"$test_dir/peer.log" 2>&1 &
@@ -40,8 +44,8 @@ terminal_pid=$!
 cupid_window=
 peer_window=
 for _ in $(seq 1 50); do
-    cupid_window=$(xdotool search --name cupid-focus-ready 2>/dev/null | head -1 || true)
-    peer_window=$(xdotool search --name cupid-focus-peer 2>/dev/null | head -1 || true)
+    cupid_window=$(xdotool search --onlyvisible --name cupid-focus-ready 2>/dev/null | head -1 || true)
+    peer_window=$(xdotool search --onlyvisible --name cupid-focus-peer 2>/dev/null | head -1 || true)
     if [[ -n "$cupid_window" && -n "$peer_window" ]]; then break; fi
     sleep 0.1
 done
