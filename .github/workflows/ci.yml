@@ -20,7 +20,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential clang libx11-dev libxft-dev libfontconfig1-dev libfreetype6-dev libutf8proc-dev xvfb xdotool zenity x11-utils fonts-dejavu-core ncurses-term
+          sudo apt-get install -y build-essential clang libx11-dev libxft-dev libfontconfig1-dev libfreetype6-dev libutf8proc-dev xvfb xdotool x11-utils fonts-dejavu-core ncurses-term
       - name: Build and test
         run: make -j2 CC="$CC" test
       - name: Sanitizer tests
