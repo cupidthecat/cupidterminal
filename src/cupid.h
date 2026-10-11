@@ -146,6 +146,7 @@ typedef struct {
     /* Partial CSI across reads (e.g. 38;2;204;204;204m split) */
     uint8_t csi_pending[1024];
     int csi_pending_len;
+    int csi_discard; /* discard an overlong CSI until its final byte */
 
     // Selection tracking
     int sel_active;
